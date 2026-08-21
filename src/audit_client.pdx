@@ -1,0 +1,213 @@
+// src/audit_client.pdx — libpdx-audit.M1-001
+// AuditClient: three-call user-facing API — audit_begin, audit_record_
+// output, audit_commit. State-machine gating per design/architecture.md
+// §4; wire format per §2. The broker binding + sys_ipc_send committed
+// body lands with M1-002 in src/audit_broker.pdx + src/syscall_shim.pdx;
+// M1-001's audit_commit stops after the state transition so the module
+// is self-contained.
+//
+// See design/architecture.md §1 for the caller wire-up example and §5
+// for the audit_id allocation shape audit_begin implements.
+// Upstream: design/tooling/r49-r50-plan.md §3.4 + §5.13 (paideia-os).
+//
+// Cross-module symbols read/written (all in AuditRecord .bss):
+//   audit_id_next, record_audit_id, record_op_name_ptr,
+//   record_op_args_ptr, record_output_schema_ptr, record_output_hash,
+//   record_exit_code, record_state
+// Resolved by unqualified linker name — the same pattern
+// libpdx-argv's parser.pdx uses to read ParsedArgs::flag_count.
+
+module AuditClient = structure {
+
+  // ============================================================================
+  // audit_begin(op_name, op_args) -> u64
+  //   rdi = op_name        (NUL-terminated string ptr; MUST be non-zero)
+  //   rsi = op_args        (NUL-terminated string ptr; may be zero if
+  //                          the tool has no argv beyond op_name)
+  //   rax = audit_id (>0) on success; 0 on AUDIT_ERR_STATE (record
+  //                        already in a non-IDLE state)
+  //
+  // Requires record_state == AUDIT_STATE_IDLE. On success transitions
+  // record_state to AUDIT_STATE_BEGUN and returns the newly-allocated
+  // audit_id. Lazy-inits audit_id_next to 1 on the very first call so
+  // audit_id 0 remains the "no audit in progress" sentinel.
+  //
+  // Register plan (leaf; no callee-save touched):
+  //   r11 = LEA scratch (paideia-as reserved scratch; every cross-module
+  //         write is r11-based)
+  //   rax = state-load / id-allocation / return value
+  //   rcx = new state / new counter (avoids reusing rax across the two
+  //         adjacent stores)
+  // ============================================================================
+
+  pub let audit_begin : (u64, u64) -> u64 !{mem} @{} =
+    fn (op_name: u64) (op_args: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M1-001 + M1-002: audit_begin entry point. Validates record_state == AUDIT_STATE_IDLE (0) via cmp reg, 0 (no test mnemonic per paideia-as conformance); on gate failure returns 0 to signal AUDIT_ERR_STATE. Lazy-init: if audit_id_next == 0 (the .bss zero start; reset() writes 1 but a consumer that skipped reset would still get a valid first id from this branch), write 1 into audit_id_next. Allocate id = audit_id_next, post-increment audit_id_next; store id in record_audit_id; store op_name / op_args in the record; write AUDIT_STATE_BEGUN (1) to record_state; return id. Every cross-module write uses `lea r11,[rip+sym]; mov [r11],reg` per the libpdx-argv parser.pdx pattern. Leaf — no callee-save touched, no push/pop; register plan documented in the file header. audit_id is a u64 counter; every real id fits inside a mov r64, imm64 without the paideia-as encoder falling back to the r11 spill path. Immediates in this function: 0 (state gate), 1 (lazy-init + state transition) — both well within the 0x7FFFFFFF cmp-imm constraint.",
+      block: {
+        // ---- Gate 1: record_state must be IDLE (0) --------------------
+        lea r11, [rip + record_state];
+        mov rax, [r11];
+        cmp rax, 0;                              // AUDIT_STATE_IDLE
+        jne audit_begin_bad_state;
+
+        // ---- Lazy-init audit_id_next to 1 if the caller skipped
+        //      AuditRecord::reset() (defence-in-depth; reset() writes 1). -
+        lea r11, [rip + audit_id_next];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne audit_begin_have_counter;
+        mov rax, 1;
+        lea r11, [rip + audit_id_next];
+        mov [r11], rax;
+
+      audit_begin_have_counter:
+        // ---- Allocate id: id = audit_id_next; audit_id_next += 1 -----
+        lea r11, [rip + audit_id_next];
+        mov rax, [r11];                          // rax = id to hand out
+        mov rcx, rax;
+        add rcx, 1;
+        lea r11, [rip + audit_id_next];
+        mov [r11], rcx;                          // audit_id_next += 1
+
+        // ---- Store id into the in-progress record --------------------
+        lea r11, [rip + record_audit_id];
+        mov [r11], rax;                          // record_audit_id = id
+
+        // ---- Store op_name / op_args pointers ------------------------
+        lea r11, [rip + record_op_name_ptr];
+        mov [r11], rdi;
+        lea r11, [rip + record_op_args_ptr];
+        mov [r11], rsi;
+
+        // ---- Transition record_state IDLE -> BEGUN -------------------
+        mov rcx, 1;                              // AUDIT_STATE_BEGUN
+        lea r11, [rip + record_state];
+        mov [r11], rcx;
+
+        // rax still holds id — return it.
+        ret
+
+      audit_begin_bad_state:
+        xor rax, rax;                            // 0 = AUDIT_ERR_STATE for begin
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_record_output(audit_id, output_schema, output_hash) -> u64
+  //   rdi = audit_id
+  //   rsi = output_schema   (NUL-terminated schema-name ptr; may be 0
+  //                          for a schema-less passthrough record)
+  //   rdx = output_hash     (M1: caller-supplied u64; M3-001 computes
+  //                          from the tool's actual output stream)
+  //   rax = AUDIT_OK on success; AUDIT_ERR_STATE or AUDIT_ERR_ID_MISMATCH
+  //         on gate failure.
+  //
+  // Requires record_state == AUDIT_STATE_BEGUN and audit_id ==
+  // record_audit_id. Transitions record_state to AUDIT_STATE_OUTPUT.
+  //
+  // Optional per §4 of design/architecture.md: a read-only tool that
+  // emits no schema-typed output may skip this and go straight to
+  // audit_commit.
+  // ============================================================================
+
+  pub let audit_record_output : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (audit_id: u64) (output_schema: u64) (output_hash: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M1-001: audit_record_output entry point. Two gates evaluated in order (state before id, per §4 of design/architecture.md — a stale id passed after commit surfaces as AUDIT_ERR_STATE, not AUDIT_ERR_ID_MISMATCH): (1) record_state == AUDIT_STATE_BEGUN (1); (2) rdi == record_audit_id. On both passing, store output_schema into record_output_schema_ptr, output_hash into record_output_hash, transition record_state BEGUN -> OUTPUT (2), return AUDIT_OK. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Leaf function; every register touched is caller-save (rdi/rsi/rdx SysV args, rax/rcx/r11 scratch). No callee-save save/restore. Immediates: 1 (BEGUN gate), 2 (state transition), 0 (implicit in xor for return-code zero) — all within paideia-as cmp-imm bounds.",
+      block: {
+        // ---- Gate 1: record_state must be BEGUN (1) ------------------
+        lea r11, [rip + record_state];
+        mov rax, [r11];
+        cmp rax, 1;                              // AUDIT_STATE_BEGUN
+        jne audit_ro_bad_state;
+
+        // ---- Gate 2: audit_id must match ------------------------------
+        lea r11, [rip + record_audit_id];
+        mov rax, [r11];
+        cmp rax, rdi;
+        jne audit_ro_bad_id;
+
+        // ---- Store output_schema + output_hash -----------------------
+        lea r11, [rip + record_output_schema_ptr];
+        mov [r11], rsi;
+        lea r11, [rip + record_output_hash];
+        mov [r11], rdx;
+
+        // ---- Transition BEGUN -> OUTPUT ------------------------------
+        mov rax, 2;                              // AUDIT_STATE_OUTPUT
+        lea r11, [rip + record_state];
+        mov [r11], rax;
+
+        xor rax, rax;                            // AUDIT_OK
+        ret
+
+      audit_ro_bad_state:
+        mov rax, 1;                              // AUDIT_ERR_STATE
+        ret
+
+      audit_ro_bad_id:
+        mov rax, 2;                              // AUDIT_ERR_ID_MISMATCH
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_commit(audit_id, exit_code) -> u64
+  //   rdi = audit_id
+  //   rsi = exit_code
+  //   rax = AUDIT_OK on success; AUDIT_ERR_STATE or AUDIT_ERR_ID_MISMATCH
+  //         on gate failure.
+  //
+  // M1-001 body: validates state (BEGUN or OUTPUT) and id, stores
+  // exit_code, transitions record_state to COMMITTED. Does NOT emit
+  // the record over IPC — that path lives in src/audit_broker.pdx as
+  // AuditBroker::audit_send_committed_record and is stitched into this
+  // entry point by libpdx-audit.M1-002.
+  //
+  // Even without the send, the state-machine commit is user-visible:
+  // the record's fields are frozen, and the consumer can (via a future
+  // AuditRecord::snapshot helper) walk the record post-commit for its
+  // own diagnostic path. This is the smallest useful scaffold — enough
+  // that the three-call API is exercisable at a paideia-as REPL before
+  // the broker binding lands.
+  // ============================================================================
+
+  pub let audit_commit : (u64, u64) -> u64 !{mem} @{} =
+    fn (audit_id: u64) (exit_code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M1-001: audit_commit entry point (scaffold body). State gate accepts BEGUN (1) OR OUTPUT (2) — a tool that skipped audit_record_output still commits legally. Id gate identical to audit_record_output's; state-before-id ordering per §4 of design/architecture.md. On both passing, store exit_code and transition record_state -> COMMITTED (3); return AUDIT_OK. M1-002 wraps this body with the audit_broker_bind + sys_ipc_send delegation (via AuditBroker::audit_send_committed_record), widening effects to !{mem,sysreg} @{cap,sched}. M1-001 stays at !{mem} @{} so the scaffold has no syscall dependency. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Leaf function; every register touched is caller-save. Immediates: 1 (BEGUN gate), 2 (OUTPUT gate), 3 (COMMITTED transition) — all within paideia-as cmp-imm bounds.",
+      block: {
+        // ---- Gate 1: record_state must be BEGUN (1) OR OUTPUT (2) ----
+        lea r11, [rip + record_state];
+        mov rax, [r11];
+        cmp rax, 1;                              // AUDIT_STATE_BEGUN
+        je  audit_commit_state_ok;
+        cmp rax, 2;                              // AUDIT_STATE_OUTPUT
+        je  audit_commit_state_ok;
+        mov rax, 1;                              // AUDIT_ERR_STATE
+        ret
+
+      audit_commit_state_ok:
+        // ---- Gate 2: audit_id must match ------------------------------
+        lea r11, [rip + record_audit_id];
+        mov rax, [r11];
+        cmp rax, rdi;
+        je  audit_commit_id_ok;
+        mov rax, 2;                              // AUDIT_ERR_ID_MISMATCH
+        ret
+
+      audit_commit_id_ok:
+        // ---- Store exit_code + transition to COMMITTED (3) ------------
+        lea r11, [rip + record_exit_code];
+        mov [r11], rsi;
+        mov rax, 3;                              // AUDIT_STATE_COMMITTED
+        lea r11, [rip + record_state];
+        mov [r11], rax;
+
+        xor rax, rax;                            // AUDIT_OK
+        ret
+      }
+    }
+}

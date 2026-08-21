@@ -1,0 +1,83 @@
+// src/audit_record.pdx — libpdx-audit.M1-001
+// AuditRecord: singleton .bss storage for one active audit record.
+// See design/architecture.md §2–§4 for layout rationale, storage
+// model, and the state machine consumers observe.
+// Upstream: design/tooling/r49-r50-plan.md §3.4 + §5.13 (paideia-os).
+
+module AuditRecord = structure {
+
+  // --- Error codes (0 = OK). Consumers pattern-match on these. ---------
+  pub let AUDIT_OK                     : u64 = 0
+  pub let AUDIT_ERR_STATE              : u64 = 1   // state-machine gate violated
+  pub let AUDIT_ERR_ID_MISMATCH        : u64 = 2   // audit_id != record_audit_id
+  pub let AUDIT_ERR_BROKER_UNAVAILABLE : u64 = 3   // svc_lookup miss / cap-table full
+  pub let AUDIT_ERR_SEND_FAILED        : u64 = 4   // sys_ipc_send non-zero return
+
+  // --- State machine values written to record_state. --------------------
+  pub let AUDIT_STATE_IDLE      : u64 = 0
+  pub let AUDIT_STATE_BEGUN     : u64 = 1
+  pub let AUDIT_STATE_OUTPUT    : u64 = 2
+  pub let AUDIT_STATE_COMMITTED : u64 = 3
+
+  // --- Broker-slot sentinel. 0xFFFF is outside every valid cap slot
+  //     ([0..255]) so a raw eq/ne comparison discriminates cleanly. ------
+  pub let AUDIT_BROKER_SLOT_UNRESOLVED : u64 = 0xFFFF
+
+  // --- M1 wire format sizes (see design/architecture.md §2). -----------
+  pub let AUDIT_PAYLOAD_BYTES : u64 = 56   // seven u64 words
+  pub let AUDIT_HDR_WORD      : u64 = 0x0000003800000120  // op=0x20 | ver=1 | reply_ep=0 | payload_len=56
+
+  // --- Singleton storage (bootstrap-scope; M3-002 migrates to caller-
+  //     owned when nested audits arrive). --------------------------------
+  //
+  // Every slot is `uninit` because .bss is zero-initialised at load time;
+  // AUDIT_STATE_IDLE (=0), record_audit_id (=0, the "no audit" sentinel),
+  // audit_id_next (=0, lazy-initialised to 1 by audit_begin on first
+  // call), audit_broker_slot (=0, then reset() writes UNRESOLVED once at
+  // consumer boot) — all rely on that zeroing.
+
+  pub let mut audit_id_next            : u64 = uninit @align(8)
+  pub let mut record_audit_id          : u64 = uninit @align(8)
+  pub let mut record_op_name_ptr       : u64 = uninit @align(8)
+  pub let mut record_op_args_ptr       : u64 = uninit @align(8)
+  pub let mut record_output_schema_ptr : u64 = uninit @align(8)
+  pub let mut record_output_hash       : u64 = uninit @align(8)
+  pub let mut record_exit_code         : u64 = uninit @align(8)
+  pub let mut record_state             : u64 = uninit @align(8)
+  pub let mut audit_broker_slot        : u64 = uninit @align(8)
+
+  // --- M1 send-time payload scratch. `.bss` again; 56 bytes = one
+  //     wire record. audit_commit memcpy-fills this before sys_ipc_send.
+  //     Sized in u64 words so paideia-as encodes it as an aligned array
+  //     rather than a byte blob. -----------------------------------------
+  pub let mut audit_payload_scratch : [u64; 7] = uninit @align(8)
+  pub let mut audit_hdr_scratch     : u64      = uninit @align(8)
+
+  // reset() — bootstrap init. Clears the in-progress record and
+  // primes audit_id_next / audit_broker_slot to their sentinel values.
+  // Consumers call this ONCE at process start (typical: right after
+  // libpdx-argv's ParsedArgs::reset() at _start), not between audits —
+  // audit_id_next must remain monotonic across audits within a process.
+  pub let reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M1-001 + M1-002: zero the eight in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
+      block: {
+        xor rax, rax;                                    // rax = 0
+        lea r11, [rip + record_audit_id];          mov [r11], rax;
+        lea r11, [rip + record_op_name_ptr];       mov [r11], rax;
+        lea r11, [rip + record_op_args_ptr];       mov [r11], rax;
+        lea r11, [rip + record_output_schema_ptr]; mov [r11], rax;
+        lea r11, [rip + record_output_hash];       mov [r11], rax;
+        lea r11, [rip + record_exit_code];         mov [r11], rax;
+        lea r11, [rip + record_state];             mov [r11], rax;
+
+        mov rax, 1;                                      // audit_id_next = 1
+        lea r11, [rip + audit_id_next];            mov [r11], rax;
+
+        mov rax, 0xFFFF;                                 // audit_broker_slot = UNRESOLVED
+        lea r11, [rip + audit_broker_slot];        mov [r11], rax;
+        ret
+      }
+    }
+}

@@ -1,0 +1,42 @@
+# libpdx-audit — caps.decl
+#
+# Wave: R49
+# Doc:  design/tooling/r49-r50-plan.md §3.4 in the paideia-os repo.
+#
+# libpdx-audit is a shared userspace library that emits an audit event
+# to the well-known service `svc.audit-journal` before its consumer
+# emits any user-visible output (D3 audit-first, paideia-os plan §1).
+#
+# The library itself performs TWO syscalls of its own:
+#
+#   * `sys_svc_lookup(name_ptr, name_len)` (SC+ ID 43) — resolves
+#     "svc.audit-journal" to a fresh KIND_IPC_ENDPOINT cap slot in the
+#     caller's cap_table. The kernel handler mints the slot; the caller
+#     must hold enough cap-table space for one slot.
+#
+#   * `sys_ipc_send(cap_slot, hdr_va, payload_va, payload_len)`
+#     (SC+ ID 42) — publishes the completed audit record to the slot
+#     minted above. Send-side rights derive from the broker row's
+#     rights_gate at registration time; libpdx-audit inherits whatever
+#     the broker chose.
+#
+# `sys_svc_lookup` is gated on the caller having sufficient authority
+# to consume a name from the R20b broker table (there is no per-name
+# access control at R20b — the broker is a shared namespace); the
+# resolved slot then carries its own WRITE/INVOKE rights per the
+# `svc.audit-journal` registration. Consumers therefore do NOT need to
+# grant libpdx-audit any additional caps beyond the ambient cap-table
+# space and the (soon-to-be) `KIND_IPC_ENDPOINT(write, svc.audit-journal)`
+# grant that the broker mints on lookup.
+#
+# The library also references its consumers' argv memory (op_name /
+# op_args pointers threaded through audit_begin) but never mutates it —
+# unlike libpdx-argv which mutates argv in place on `--foo=bar`.
+requires: KIND_IPC_ENDPOINT(write, svc.audit-journal) via svc_lookup
+
+# Declared output schemas — the M1 wire format is a stub 56-byte
+# fixed-layout record. The full UEJ_KIND_TOOL_INVOKE / OUTPUT / EXIT
+# schema binding via libpdx-semantic-pipe lands in M3 per
+# r49-r50-plan.md §5.13 (paideia-os).
+declares_output_schemas:
+  - PdxAuditRecord@0.1
