@@ -1,0 +1,218 @@
+// src/audit_broker.pdx — libpdx-audit.M1-002
+// AuditBroker: svc.audit-journal binding + audit-record marshalling +
+// sys_ipc_send delivery. Two entry points:
+//
+//   audit_broker_bind()              -> AUDIT_OK | AUDIT_ERR_BROKER_UNAVAILABLE
+//   audit_send_committed_record()    -> AUDIT_OK | AUDIT_ERR_BROKER_UNAVAILABLE
+//                                     | AUDIT_ERR_SEND_FAILED
+//
+// audit_broker_bind resolves the well-known service name via
+// sys_svc_lookup (SC+ ID 43) and caches the returned cap slot in
+// AuditRecord::audit_broker_slot. Idempotent: subsequent calls fast-
+// return when the cached slot is already valid.
+//
+// audit_send_committed_record marshals the seven-u64 payload from the
+// AuditRecord singleton into audit_payload_scratch, writes the packed-
+// u64 IPC header into audit_hdr_scratch, then invokes sys_ipc_send
+// (SC+ ID 42). Any non-zero send result becomes AUDIT_ERR_SEND_FAILED
+// verbatim (M2-003 lands the bounded retry-with-backoff on top).
+//
+// See design/architecture.md §5 (audit_id allocation), §6 (broker
+// binding), §7 (send failure discipline), §2 (wire format).
+// Upstream: design/tooling/r49-r50-plan.md §3.4 + §5.13 (paideia-os).
+//
+// Cross-module symbols read/written (all in AuditRecord .bss):
+//   audit_broker_slot, record_audit_id, record_op_name_ptr,
+//   record_op_args_ptr, record_output_schema_ptr, record_output_hash,
+//   record_exit_code, audit_payload_scratch, audit_hdr_scratch
+// Cross-module functions called:
+//   sys_svc_lookup   (src/syscall_shim.pdx)
+//   sys_ipc_send     (src/syscall_shim.pdx)
+
+module AuditBroker = structure {
+
+  // ============================================================================
+  // The canonical svc.audit-journal name, byte-for-byte identical to
+  // the kernel-side declaration at src/kernel/core/ipc/audit_journal_
+  // broker.pdx in paideia-os. 17 chars + 3 NUL bytes of padding.
+  // sys_svc_lookup is length-explicit (does not read past name_len)
+  // so the NUL padding is defensive; matching the kernel declaration
+  // lets a future M4-002 memcmp trivially verify agreement.
+  // ============================================================================
+  pub let audit_broker_name : [u8; 20] = "svc.audit-journal\0\0\0"
+  pub let AUDIT_BROKER_NAME_LEN : u64 = 17
+
+  // ============================================================================
+  // audit_broker_bind() -> u64
+  //   rax = AUDIT_OK (0) on success (either the cache was already
+  //         populated or sys_svc_lookup returned a slot in [0..255])
+  //       | AUDIT_ERR_BROKER_UNAVAILABLE (3) on any svc_lookup error
+  //
+  // Fast path: one load + one compare (audit_broker_slot != UNRESOLVED
+  // 0xFFFF). Slow path: sys_svc_lookup + range gate + store.
+  //
+  // Cap slot ids returned by sys_svc_lookup are in [0..255] — well
+  // below any negative-errno sentinel (all have bit 63 set), so
+  // `cmp rax, 256; jae error` discriminates cleanly per the sentinel
+  // discipline documented in the paideia-os handler
+  // (sys_svc_lookup.pdx §Result-code sentinels).
+  //
+  // Register plan: rax = svc_lookup return + final rax, r11 = LEA
+  // scratch. Wraps one call so uses SysV push/pop discipline: push
+  // rbx alone would break rsp % 16 == 0 for a nested call, but we
+  // don't need to preserve any callee-save (audit_broker_bind has no
+  // register state to keep across the sys_svc_lookup call). rbp/rbx
+  // untouched; the trampoline itself preserves them.
+  // ============================================================================
+
+  pub let audit_broker_bind : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "libpdx-audit.M1-002: audit_broker_bind entry point. Idempotent svc.audit-journal binding. Fast path: load audit_broker_slot; if != AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) return AUDIT_OK (0). Slow path: sys_svc_lookup(&audit_broker_name, 17) -> rax; if rax < 256 store as audit_broker_slot + return AUDIT_OK; else return AUDIT_ERR_BROKER_UNAVAILABLE (3). The `cmp rax, 256; jae error` discriminates a valid slot from every negative-errno sentinel (all have bit 63 set — sys_svc_lookup.pdx §Result-code sentinels: -EINVAL 0xFF..FFEA, -EFAULT 0xFF..FFF2, -ENOENT 0xFF..FFFE, -ENOSPC 0xFF..FFE4 all > 256 when interpreted unsigned, and jae is unsigned). Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Register plan: rdi/rsi loaded from LEA + immediate before the call; rax = return; r11 = LEA scratch. sys_svc_lookup preserves rbx/r12..r15 by SysV so this function saves no callee-save. Effects match sys_svc_lookup: !{mem, sysreg} @{cap}. Immediates: 0xFFFF (UNRESOLVED sentinel), 17 (name_len), 256 (sentinel discriminator), 3 (AUDIT_ERR_BROKER_UNAVAILABLE) — all within paideia-as cmp-imm bounds.",
+      block: {
+        // ---- Fast path: cache hit? ------------------------------------
+        lea r11, [rip + audit_broker_slot];
+        mov rax, [r11];
+        cmp rax, 0xFFFF;                         // AUDIT_BROKER_SLOT_UNRESOLVED
+        jne audit_bind_ok;                       // already resolved -> OK
+
+        // ---- Slow path: sys_svc_lookup(&audit_broker_name, 17) --------
+        lea rdi, [rip + audit_broker_name];
+        mov rsi, 17;                             // AUDIT_BROKER_NAME_LEN
+        call sys_svc_lookup;
+
+        // rax = slot [0..255] on hit, or a negative-errno u64 on miss.
+        // 256 is the discriminator — every valid slot is strictly less.
+        cmp rax, 256;
+        jae audit_bind_fail;
+
+        // Cache the slot for subsequent audit_send_committed_record calls.
+        lea r11, [rip + audit_broker_slot];
+        mov [r11], rax;
+        // fall through
+
+      audit_bind_ok:
+        xor rax, rax;                            // AUDIT_OK
+        ret
+
+      audit_bind_fail:
+        mov rax, 3;                              // AUDIT_ERR_BROKER_UNAVAILABLE
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_send_committed_record() -> u64
+  //   rax = AUDIT_OK                     on success
+  //       | AUDIT_ERR_BROKER_UNAVAILABLE if audit_broker_bind fails
+  //       | AUDIT_ERR_SEND_FAILED        if sys_ipc_send returns non-zero
+  //
+  // Expects the caller (AuditClient::audit_commit) to have already
+  // validated the state gate + id gate and transitioned record_state
+  // to AUDIT_STATE_COMMITTED. Reads seven u64 fields from the
+  // AuditRecord singleton, marshals them into audit_payload_scratch
+  // in the wire order documented in design/architecture.md §2:
+  //
+  //   [0] record_audit_id
+  //   [1] UEJ_KIND_TOOL_INVOKE (130)        // M1 stub; M2-001 splits
+  //   [2] record_exit_code
+  //   [3] record_op_name_ptr
+  //   [4] record_op_args_ptr
+  //   [5] record_output_schema_ptr
+  //   [6] record_output_hash
+  //
+  // Writes the packed IPC header word (AUDIT_HDR_WORD = 0x00000038_00000120
+  // — op=0x20 | ver=1 | reply_ep=0 | payload_len=56) into
+  // audit_hdr_scratch, then invokes sys_ipc_send.
+  //
+  // Register plan (this function wraps two nested calls —
+  // audit_broker_bind + sys_ipc_send — and does not need to preserve
+  // any state across them beyond the cached slot, which lives in
+  // .bss). No callee-save touched: rbx/r12..r15 all unused. rsp is
+  // aligned at entry per SysV; the nested calls also arrive at
+  // rsp % 16 == 0 because no push has happened.
+  // ============================================================================
+
+  pub let audit_send_committed_record : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "libpdx-audit.M1-002: audit_send_committed_record. (1) Call audit_broker_bind — on non-zero return, propagate as AUDIT_ERR_BROKER_UNAVAILABLE (bind already returns exactly that code; verbatim pass-through). (2) Marshal the seven-u64 payload: load each AuditRecord field via `lea r11,[rip+sym]; mov rax,[r11]; mov [scratch + N*8], rax` and write UEJ_KIND_TOOL_INVOKE (130) at index [1] (M1 stub — M2-001 splits INVOKE/OUTPUT/EXIT). (3) Write the packed hdr word AUDIT_HDR_WORD (0x0000_0038_0000_0120: op=0x20 AUDIT_EVENT | ver=1 | reply_endpoint_id=0 fire-and-forget | payload_len=56) into audit_hdr_scratch — a two-step store (mov rax,imm64; mov [scratch],rax) because paideia-as does not encode mov [mem],imm64 in one instruction. (4) Load cached slot from audit_broker_slot into rdi; LEA hdr into rsi, payload scratch into rdx, immediate 56 into rcx; call sys_ipc_send. (5) On non-zero return, translate to AUDIT_ERR_SEND_FAILED (4); on zero, return AUDIT_OK (0). Register plan: no callee-save touched — rax/rcx/rdi/rsi/rdx/r10/r11 are all caller-save under SysV, sys_ipc_send handles the r10 shuffle internally. rsp stays aligned across both calls because no push occurs. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Immediates: 130 (UEJ_KIND_TOOL_INVOKE), 56 (payload_len), 0 (AUDIT_OK / equality gate), 3 (AUDIT_ERR_BROKER_UNAVAILABLE), 4 (AUDIT_ERR_SEND_FAILED) — all within paideia-as cmp-imm bounds. AUDIT_HDR_WORD (0x0000003800000120) fits inside a mov r64,imm64 which paideia-as encodes as a MOVABS.",
+      block: {
+        // ---- Step 1: ensure the broker slot is bound. ------------------
+        call audit_broker_bind;
+        cmp rax, 0;                              // AUDIT_OK
+        jne audit_send_bind_fail;                // rax already AUDIT_ERR_BROKER_UNAVAILABLE
+
+        // ---- Step 2: marshal the seven-u64 payload into scratch. ------
+        // Index [0] — record_audit_id
+        lea r11, [rip + record_audit_id];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 0], rax;
+
+        // Index [1] — event_kind = UEJ_KIND_TOOL_INVOKE (130). Stub for
+        // M1; M2-001 discriminates INVOKE / OUTPUT / EXIT per event.
+        mov rax, 130;
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 8], rax;
+
+        // Index [2] — record_exit_code
+        lea r11, [rip + record_exit_code];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 16], rax;
+
+        // Index [3] — record_op_name_ptr
+        lea r11, [rip + record_op_name_ptr];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 24], rax;
+
+        // Index [4] — record_op_args_ptr
+        lea r11, [rip + record_op_args_ptr];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 32], rax;
+
+        // Index [5] — record_output_schema_ptr
+        lea r11, [rip + record_output_schema_ptr];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 40], rax;
+
+        // Index [6] — record_output_hash
+        lea r11, [rip + record_output_hash];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 48], rax;
+
+        // ---- Step 3: write the packed hdr word. -----------------------
+        mov rax, 0x0000003800000120;             // AUDIT_HDR_WORD
+        lea r11, [rip + audit_hdr_scratch];
+        mov [r11], rax;
+
+        // ---- Step 4: sys_ipc_send(slot, hdr, payload, 56). ------------
+        lea r11, [rip + audit_broker_slot];
+        mov rdi, [r11];                          // cap_slot
+        lea rsi, [rip + audit_hdr_scratch];      // hdr_va
+        lea rdx, [rip + audit_payload_scratch];  // payload_va
+        mov rcx, 56;                             // payload_len (AUDIT_PAYLOAD_BYTES)
+        call sys_ipc_send;
+
+        // ---- Step 5: translate send result. ---------------------------
+        cmp rax, 0;                              // SYS_IPC_SEND_OK
+        jne audit_send_ipc_fail;
+        xor rax, rax;                            // AUDIT_OK
+        ret
+
+      audit_send_ipc_fail:
+        mov rax, 4;                              // AUDIT_ERR_SEND_FAILED
+        ret
+
+      audit_send_bind_fail:
+        // rax already carries AUDIT_ERR_BROKER_UNAVAILABLE (3) from
+        // audit_broker_bind — pass through.
+        ret
+      }
+    }
+}

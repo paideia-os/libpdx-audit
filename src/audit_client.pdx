@@ -1,10 +1,10 @@
-// src/audit_client.pdx — libpdx-audit.M1-001
+// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002
 // AuditClient: three-call user-facing API — audit_begin, audit_record_
 // output, audit_commit. State-machine gating per design/architecture.md
-// §4; wire format per §2. The broker binding + sys_ipc_send committed
-// body lands with M1-002 in src/audit_broker.pdx + src/syscall_shim.pdx;
-// M1-001's audit_commit stops after the state transition so the module
-// is self-contained.
+// §4; wire format per §2. M1-002 stitched the send path in: audit_commit
+// now calls AuditBroker::audit_send_committed_record after the state
+// transition, propagating AUDIT_ERR_BROKER_UNAVAILABLE / AUDIT_ERR_SEND_
+// FAILED verbatim and resetting record_state to IDLE on success.
 //
 // See design/architecture.md §1 for the caller wire-up example and §5
 // for the audit_id allocation shape audit_begin implements.
@@ -14,6 +14,8 @@
 //   audit_id_next, record_audit_id, record_op_name_ptr,
 //   record_op_args_ptr, record_output_schema_ptr, record_output_hash,
 //   record_exit_code, record_state
+// Cross-module functions called (M1-002):
+//   audit_send_committed_record  (src/audit_broker.pdx)
 // Resolved by unqualified linker name — the same pattern
 // libpdx-argv's parser.pdx uses to read ParsedArgs::flag_count.
 
@@ -157,27 +159,30 @@ module AuditClient = structure {
   // audit_commit(audit_id, exit_code) -> u64
   //   rdi = audit_id
   //   rsi = exit_code
-  //   rax = AUDIT_OK on success; AUDIT_ERR_STATE or AUDIT_ERR_ID_MISMATCH
-  //         on gate failure.
+  //   rax = AUDIT_OK on success;
+  //       | AUDIT_ERR_STATE / AUDIT_ERR_ID_MISMATCH  on gate failure
+  //       | AUDIT_ERR_BROKER_UNAVAILABLE             if bind fails
+  //       | AUDIT_ERR_SEND_FAILED                    if sys_ipc_send fails
   //
-  // M1-001 body: validates state (BEGUN or OUTPUT) and id, stores
-  // exit_code, transitions record_state to COMMITTED. Does NOT emit
-  // the record over IPC — that path lives in src/audit_broker.pdx as
-  // AuditBroker::audit_send_committed_record and is stitched into this
-  // entry point by libpdx-audit.M1-002.
+  // M1-002 body: validates state (BEGUN or OUTPUT) and id, stores
+  // exit_code, transitions record_state to COMMITTED, then delegates
+  // to AuditBroker::audit_send_committed_record (src/audit_broker.pdx)
+  // to bind the broker (idempotent) and issue sys_ipc_send. On send
+  // success, resets record_state to IDLE so a subsequent audit_begin
+  // in the same process can start a fresh record; on send failure,
+  // leaves record_state at COMMITTED so a diagnostic can walk the
+  // record post-mortem.
   //
-  // Even without the send, the state-machine commit is user-visible:
-  // the record's fields are frozen, and the consumer can (via a future
-  // AuditRecord::snapshot helper) walk the record post-commit for its
-  // own diagnostic path. This is the smallest useful scaffold — enough
-  // that the three-call API is exercisable at a paideia-as REPL before
-  // the broker binding lands.
+  // Consumer contract on any non-OK return: exit 3 per I4 (system
+  // error) and MUST NOT emit user-visible output. This is the D3
+  // audit-first upgrade — a tool that cannot prove its output was
+  // journalled is a tool whose output the operator cannot trust.
   // ============================================================================
 
-  pub let audit_commit : (u64, u64) -> u64 !{mem} @{} =
+  pub let audit_commit : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (audit_id: u64) (exit_code: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M1-001: audit_commit entry point (scaffold body). State gate accepts BEGUN (1) OR OUTPUT (2) — a tool that skipped audit_record_output still commits legally. Id gate identical to audit_record_output's; state-before-id ordering per §4 of design/architecture.md. On both passing, store exit_code and transition record_state -> COMMITTED (3); return AUDIT_OK. M1-002 wraps this body with the audit_broker_bind + sys_ipc_send delegation (via AuditBroker::audit_send_committed_record), widening effects to !{mem,sysreg} @{cap,sched}. M1-001 stays at !{mem} @{} so the scaffold has no syscall dependency. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Leaf function; every register touched is caller-save. Immediates: 1 (BEGUN gate), 2 (OUTPUT gate), 3 (COMMITTED transition) — all within paideia-as cmp-imm bounds.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "libpdx-audit.M1-001 + M1-002: audit_commit entry point. State gate accepts BEGUN (1) OR OUTPUT (2) — a tool that skipped audit_record_output still commits legally. Id gate identical to audit_record_output's; state-before-id ordering per §4 of design/architecture.md. On both passing, store exit_code, transition record_state -> COMMITTED (3), then call AuditBroker::audit_send_committed_record (src/audit_broker.pdx) which handles the broker bind + payload marshal + sys_ipc_send. Its return code propagates verbatim: AUDIT_OK, AUDIT_ERR_BROKER_UNAVAILABLE (3), or AUDIT_ERR_SEND_FAILED (4). On AUDIT_OK, reset record_state to IDLE (0) so a subsequent audit_begin can start fresh; on failure, leave record_state at COMMITTED so a diagnostic can walk the record post-mortem. Effects widened to !{mem, sysreg} @{cap, sched} from M1-001's !{mem} @{} to cover the transitive sys_ipc_send call — cap for the endpoint-cap consume, sched for the send-side wake path in sys_ipc_send_body. Register plan: rdi = audit_id (validated then discarded), rsi = exit_code (stored then discarded), rax = return, rcx = zero-write value for the IDLE reset (avoids clobbering rax which carries AUDIT_OK), r11 = LEA scratch. audit_send_committed_record preserves rbx/r12..r15 by SysV so this function saves no callee-save. Immediates: 1 (BEGUN gate), 2 (OUTPUT gate), 3 (COMMITTED transition), 0 (IDLE reset + AUDIT_OK compare) — all within paideia-as cmp-imm bounds.",
       block: {
         // ---- Gate 1: record_state must be BEGUN (1) OR OUTPUT (2) ----
         lea r11, [rip + record_state];
@@ -206,7 +211,20 @@ module AuditClient = structure {
         lea r11, [rip + record_state];
         mov [r11], rax;
 
-        xor rax, rax;                            // AUDIT_OK
+        // ---- Delegate to the broker for bind + marshal + send. --------
+        call audit_send_committed_record;
+
+        // ---- On AUDIT_OK, reset record_state to IDLE so a subsequent
+        //      audit_begin can start fresh. rax already = 0; use rcx
+        //      for the state write so the return code survives.
+        cmp rax, 0;                              // AUDIT_OK
+        jne audit_commit_done;
+
+        xor rcx, rcx;                            // AUDIT_STATE_IDLE
+        lea r11, [rip + record_state];
+        mov [r11], rcx;
+
+      audit_commit_done:
         ret
       }
     }

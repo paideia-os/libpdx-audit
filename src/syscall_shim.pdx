@@ -1,0 +1,69 @@
+// src/syscall_shim.pdx — libpdx-audit.M1-002
+// Minimal syscall trampolines libpdx-audit needs to bind the
+// svc.audit-journal broker and emit a committed audit record.
+//
+// Two wrappers, both drawn from paideia-os's SC+ table
+// (design/kernel/r17-m1-001-syscall-shim.md):
+//
+//   sys_svc_lookup   SC+ ID 43 — resolves a broker name to a fresh
+//                                 KIND_IPC_ENDPOINT cap slot in the
+//                                 caller's cap_table.
+//   sys_ipc_send     SC+ ID 42 — non-blocking send on an IPC endpoint
+//                                 using a previously-resolved cap slot.
+//
+// ABI: SysV on entry (rdi/rsi/rdx/rcx/r8/r9) -> SYSCALL on syscall
+// (rdi/rsi/rdx/r10/r8/r9). Both wrappers here are arity ≤ 3 so no
+// SysV -> SYSCALL r10 shuffle is needed (matches the arity-0..3
+// template in paideia-os's src/user/syscall_shim.pdx).
+//
+// The trampolines are straight-line: `mov rax, N; syscall; ret`.
+// paideia-as declares them as `!{mem, sysreg} @{cap[, sched]}` so
+// the type-system tail matches the widest kernel handler in the
+// call chain (`sys_ipc_send_body` is `!{mem, sysreg} @{cap, sched}`;
+// `sys_svc_lookup_body` is `!{mem, sysreg} @{cap}`).
+
+module SyscallShim = structure {
+
+  // sys_svc_lookup(name_ptr, name_len) -> u64
+  //   rdi = name_ptr        (userspace NUL-terminated or length-explicit)
+  //   rsi = name_len        (must be in [1..31] per svc_broker.pdx gate)
+  //   rax = cap slot id in [0..255] on hit
+  //       | 0xFFFFFFFFFFFFFFEA (-EINVAL) name_len out of range
+  //       | 0xFFFFFFFFFFFFFFF2 (-EFAULT) walker fail on user name buffer
+  //       | 0xFFFFFFFFFFFFFFFE (-ENOENT) no broker row matches
+  //       | 0xFFFFFFFFFFFFFFE4 (-ENOSPC) cap_table full
+  //
+  // Cap slot ids are well below every negative-errno sentinel, so a
+  // caller can `cmp rax, 256; jae error` to discriminate cleanly.
+  pub let sys_svc_lookup : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "libpdx-audit.M1-002: SC+ ID 43 trampoline (sys_svc_lookup). SysV args rdi/rsi -> SYSCALL args rdi/rsi. Arity 2 < 4 so no r10 shuffle needed (paideia-os src/user/syscall_shim.pdx §3.2 template). Effects match the kernel handler at src/kernel/core/syscall/handlers/sys_svc_lookup.pdx (!{mem, sysreg} @{cap}) — sys_svc_lookup_body walks user memory (mem) via user_read_bytes_via_walk, reads _current_tcb (sysreg), and mints a cap into cap_table (@{cap}). Leaf trampoline; no callee-save touched, no push/pop.",
+      block: {
+        mov rax, 43;
+        syscall;
+        ret
+      }
+    }
+
+  // sys_ipc_send(cap_slot, user_hdr_va, user_payload_va, payload_len)
+  //   rdi = cap_slot         (must hold a KIND_IPC_ENDPOINT with WRITE)
+  //   rsi = user_hdr_va      (8-byte packed frame header)
+  //   rdx = user_payload_va  (payload buffer)
+  //   rcx = payload_len      (bytes; kernel caps at PENDING_PAYLOAD_MAX_BYTES)
+  //   rax = 0 (SYS_IPC_SEND_OK) OR one of the negative-errno sentinels
+  //         at src/kernel/core/syscall/handlers/sys_ipc_send.pdx.
+  //
+  // Arity 4 requires the SysV -> SYSCALL r10 shuffle: rcx -> r10.
+  pub let sys_ipc_send : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (cap_slot: u64) (user_hdr_va: u64) (user_payload_va: u64) (payload_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "libpdx-audit.M1-002: SC+ ID 42 trampoline (sys_ipc_send). SysV args rdi/rsi/rdx/rcx -> SYSCALL args rdi/rsi/rdx/r10 (arg3 shuffle via `mov r10, rcx` prefix — paideia-os src/user/syscall_shim.pdx §3.3 template, same shape as sys_wait4). Effects match the kernel handler at src/kernel/core/syscall/handlers/sys_ipc_send.pdx (!{mem, sysreg} @{cap, sched}): mem via user_bounce_send + endpoint_write_pending, sysreg transitively via sched_wake's runq_enqueue, @{cap} for the endpoint-cap consume, @{sched} for the wake path. Leaf trampoline; no callee-save touched, no push/pop.",
+      block: {
+        mov r10, rcx;
+        mov rax, 42;
+        syscall;
+        ret
+      }
+    }
+}
