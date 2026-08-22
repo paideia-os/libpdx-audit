@@ -196,55 +196,55 @@ module TestReplayGolden = structure {
         xor rax, rax;                            // 0 = all pass
         pop r13;
         pop r12;
-        ret
+        ret;
 
       trg_fail_1:
         mov rax, 1;
         pop r13;
         pop r12;
-        ret
+        ret;
 
       trg_fail_2:
         mov rax, 2;
         pop r13;
         pop r12;
-        ret
+        ret;
 
       trg_fail_3:
         mov rax, 3;
         pop r13;
         pop r12;
-        ret
+        ret;
 
       trg_fail_4:
         mov rax, 4;
         pop r13;
         pop r12;
-        ret
+        ret;
 
       trg_fail_5:
         mov rax, 5;
         pop r13;
         pop r12;
-        ret
+        ret;
 
       trg_fail_6:
         mov rax, 6;
         pop r13;
         pop r12;
-        ret
+        ret;
 
       trg_fail_7:
         mov rax, 7;
         pop r13;
         pop r12;
-        ret
+        ret;
 
       trg_fail_8:
         mov rax, 8;
         pop r13;
         pop r12;
-        ret
+        ret;
       }
     }
 }

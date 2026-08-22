@@ -42,7 +42,7 @@ module SyscallShim = structure {
       block: {
         mov rax, 43;
         syscall;
-        ret
+        ret;
       }
     }
 
@@ -63,7 +63,7 @@ module SyscallShim = structure {
         mov r10, rcx;
         mov rax, 42;
         syscall;
-        ret
+        ret;
       }
     }
 }

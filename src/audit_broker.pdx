@@ -104,11 +104,11 @@ module AuditBroker = structure {
 
       audit_bind_ok:
         xor rax, rax;                            // AUDIT_OK
-        ret
+        ret;
 
       audit_bind_fail:
         mov rax, 3;                              // AUDIT_ERR_BROKER_UNAVAILABLE
-        ret
+        ret;
       }
     }
 
@@ -266,7 +266,7 @@ module AuditBroker = structure {
         xor rax, rax;                            // AUDIT_OK
         pop r13;
         pop r12;
-        ret
+        ret;
 
       asr_ipc_fail:
         // M2-002: set the sticky failure flag so the consumer's
@@ -279,7 +279,7 @@ module AuditBroker = structure {
         mov rax, 4;                              // AUDIT_ERR_SEND_FAILED
         pop r13;
         pop r12;
-        ret
+        ret;
 
       asr_bind_fail:
         // rax already carries AUDIT_ERR_BROKER_UNAVAILABLE (3) from
@@ -291,7 +291,7 @@ module AuditBroker = structure {
         mov rax, 3;                              // AUDIT_ERR_BROKER_UNAVAILABLE (re-assert)
         pop r13;
         pop r12;
-        ret
+        ret;
       }
     }
 }

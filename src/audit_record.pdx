@@ -165,7 +165,7 @@ module AuditRecord = structure {
 
         mov rax, 0xFFFF;                                 // audit_broker_slot = UNRESOLVED
         lea r11, [rip + audit_broker_slot];        mov [r11], rax;
-        ret
+        ret;
       }
     }
 }

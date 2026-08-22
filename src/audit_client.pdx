@@ -105,7 +105,7 @@ module AuditClient = structure {
         // Send succeeded — return the allocated audit_id.
         lea r11, [rip + record_audit_id];
         mov rax, [r11];
-        ret
+        ret;
 
       audit_begin_send_fail:
         // Broker/send failure — treat as fatal for the caller. Return 0
@@ -113,11 +113,11 @@ module AuditClient = structure {
         // to exit 3 with no output emission. record_state stays at
         // BEGUN so a post-mortem can walk the in-progress record.
         xor rax, rax;
-        ret
+        ret;
 
       audit_begin_bad_state:
         xor rax, rax;                            // 0 = AUDIT_ERR_STATE for begin
-        ret
+        ret;
       }
     }
 
@@ -172,15 +172,15 @@ module AuditClient = structure {
         call audit_send_record;
         // rax already carries AUDIT_OK / AUDIT_ERR_BROKER_UNAVAILABLE /
         // AUDIT_ERR_SEND_FAILED — propagate verbatim.
-        ret
+        ret;
 
       audit_ro_bad_state:
         mov rax, 1;                              // AUDIT_ERR_STATE
-        ret
+        ret;
 
       audit_ro_bad_id:
         mov rax, 2;                              // AUDIT_ERR_ID_MISMATCH
-        ret
+        ret;
       }
     }
 
@@ -221,7 +221,7 @@ module AuditClient = structure {
         cmp rax, 2;                              // AUDIT_STATE_OUTPUT
         je  audit_commit_state_ok;
         mov rax, 1;                              // AUDIT_ERR_STATE
-        ret
+        ret;
 
       audit_commit_state_ok:
         // ---- Gate 2: audit_id must match ------------------------------
@@ -230,7 +230,7 @@ module AuditClient = structure {
         cmp rax, rdi;
         je  audit_commit_id_ok;
         mov rax, 2;                              // AUDIT_ERR_ID_MISMATCH
-        ret
+        ret;
 
       audit_commit_id_ok:
         // ---- Store exit_code + transition to COMMITTED (3) ------------
@@ -255,7 +255,7 @@ module AuditClient = structure {
         mov [r11], rcx;
 
       audit_commit_done:
-        ret
+        ret;
       }
     }
 
@@ -302,11 +302,11 @@ module AuditClient = structure {
         jne audit_cee_no;
 
         mov rax, 1;                              // safe to emit output
-        ret
+        ret;
 
       audit_cee_no:
         xor rax, rax;                            // refuse output (exit 3)
-        ret
+        ret;
       }
     }
 
@@ -365,11 +365,11 @@ module AuditClient = structure {
         mov [r11], rdi;
 
         xor rax, rax;                            // AUDIT_OK
-        ret
+        ret;
 
       asp_bad_state:
         mov rax, 1;                              // AUDIT_ERR_STATE
-        ret
+        ret;
       }
     }
 }
