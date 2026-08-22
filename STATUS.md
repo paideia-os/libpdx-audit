@@ -1,7 +1,7 @@
 # libpdx-audit — status
 
 **Wave:** R49 shared library
-**Current milestone:** M2 (core implementation) — in progress
+**Current milestone:** M2 (core implementation) — landed
 
 ## Milestone progress
 
@@ -28,6 +28,13 @@
   New AuditClient::audit_can_emit_output() -> u64 helper reads the
   slot; returns 1 when safe, 0 when the consumer must exit 3 per I4
   without emitting output. reset() clears the flag.
+- M2-003 — retry-with-backoff (bounded 3 retries then hard-fail):
+  landed. audit_send_record wraps sys_ipc_send in a retry-on-EAGAIN
+  loop; r13 counts attempts (0..3), with a fixed 4096-cycle spin
+  backoff between attempts. Only SYS_IPC_SEND_ERR_EAGAIN (1) triggers
+  retry; every other non-zero return (BAD_ID / PAYLOAD_LEN / EFAULT
+  / CHANDEAD) hard-fails immediately. Exhausted retries fall through
+  to the M2-002 sticky-flag + AUDIT_ERR_SEND_FAILED epilogue.
 
 ## Upstream design
 
@@ -38,4 +45,7 @@ wave-level rationale and the full milestone breakdown. See
 
 ## Next milestone
 
-- M2-003 retry-with-backoff (bounded 3 retries then hard-fail on EAGAIN).
+M3 — Semantic-pipe / audit integration. BLAKE3-truncated output-stream
+hash computation (M3-001); parent-child linkage with shell's
+ShellCommandRecord via audit_id (M3-002). Depends on shell.M2 and
+libpdx-semantic-pipe.M2 per plan.md §5.13.
