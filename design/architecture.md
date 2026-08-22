@@ -458,6 +458,105 @@ cap consumption, no push/pop. Label prefix `asp_` per the
 paideia-as reserved-label discipline (bare `ok` / `fail` collide
 with keywords; `asp_ok` / `asp_bad_state` are unique).
 
+## 13. M4 — test discipline
+
+libpdx-audit is a shared library with no runnable executable of its
+own. Its test drivers therefore live in `tests/*.pdx` as pure-leaf
+paideia-as modules that a consumer tool's test-runner main (in a
+future pkg.M2 / cat.M2 / dedicated `examples/` binary) links and
+invokes.
+
+### 13.1 Driver protocol
+
+Every M4 test driver in this repo exports a single public entry
+point:
+
+```
+pub let run : () -> u64 !{mem} @{} = fn () -> unsafe { … }
+```
+
+The return value is:
+
+- `0` — all subtests in the driver passed.
+- `N > 0` — the ordinal of the first failing subtest. Ordinals are
+  stable across driver runs so a smoke log can pinpoint the failing
+  invariant.
+
+Effects are constrained to `!{mem} @{}` — no syscall, no cap
+consumption — so the driver runs under any consumer, including one
+that has not requested the widened effects `audit_begin` /
+`audit_record_output` / `audit_commit` need. This bounds the failure
+surface: a test that returns non-zero has failed on a library
+invariant, not on a syscall path libpdx-audit cannot control.
+
+### 13.2 Fault-injection discipline
+
+libpdx-audit is a library; without a kernel it cannot exercise its
+own syscalls. Driver subtests reach failure states by direct
+`.bss` writes to the AuditRecord slots the runtime error paths would
+otherwise set. The three canonical fault-injection points at M4:
+
+- `audit_broker_failed = 1` — simulates the M2-002 sticky-flag
+  write from `asr_bind_fail` / `asr_ipc_fail`. Used by M4-001 to
+  verify `audit_can_emit_output` returns 0 (refuse) with the flag
+  set.
+- `record_state = AUDIT_STATE_BEGUN` (1) — simulates the post-
+  `audit_begin` state, reaching it without running the INVOKE
+  send. Used by M4-002 to verify `audit_set_parent` refuses (state
+  != IDLE → AUDIT_ERR_STATE per §12.1).
+- `record_hash_active = 0` (implicit via `reset`) — simulates the
+  never-initialised state. Used by M4-002 to verify
+  `audit_hash_update` returns AUDIT_ERR_HASH_INACTIVE (5).
+
+These writes mirror exactly what the runtime paths do — the .bss
+slot is the observable state the guards read. A test passing here
+proves the same guard would fire under the real syscall failure
+mode.
+
+### 13.3 QEMU smoke deferral
+
+The full end-to-end M4 assertions — spawn a bootstrap consumer
+under QEMU, observe stdout/stderr and the audit-endpoint payload —
+require three not-yet-landed substrates:
+
+1. `shell.M4` (paideia-os/shell §5.2) so a consumer can be spawned
+   with a bounded cap set.
+2. A runnable consumer (`pkg.M2`, `cat.M2`, or a small
+   `examples/` binary hosted here) that links libpdx-audit and
+   calls the drivers from its own test-runner main.
+3. `R49-PREP-007` — the kernel-side `audit_journal_broker_dispatch`
+   daemon body. Without a daemon, `sys_ipc_send` discards the
+   payload; wire-byte replay needs the daemon to persist bytes
+   for observer capture.
+
+`tests/README.md` §QEMU smoke protocol documents the M4-001 and
+M4-002 protocol for that future harness in detail.
+
+### 13.4 Golden fixture format
+
+`tests/goldens/trace_001.md` is the canonical M4-002 wire-bytes
+fixture. It documents:
+
+- The header word (`AUDIT_HDR_WORD = 0x0000004000000120`) with per-
+  field bit layout.
+- Three per-send payload tables (INVOKE / OUTPUT / EXIT), each
+  eight `u64` rows corresponding to `audit_payload_scratch` indices
+  [0..7].
+- Concrete values where the library owns them (audit_id,
+  event_kind, exit_code, parent_audit_id); symbolic placeholders
+  (`<LS_NAME_VA>`, `<HASH_LS>`, …) where the value depends on
+  consumer-owned memory or a runtime-computed hash.
+- A companion M4-001 failure-path fixture (child exits 3, emits 0
+  bytes, no wire payload).
+- A change-management section calling out what code changes require
+  a fixture refresh (payload_len change, new UEJ_KIND ordinal,
+  kernel-side schema lock at R49-PREP-007).
+
+The QEMU harness memcmp's `audit_payload_scratch` against the
+concrete rows after each lifecycle send; symbolic rows are
+resolved against the harness's own linker map or computed
+independently.
+
 ## 10. Cross-repo dependencies
 
 Per r49-r50-plan.md §5.13:

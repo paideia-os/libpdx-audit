@@ -1,0 +1,250 @@
+// tests/test_replay_golden.pdx — libpdx-audit.M4-002
+// Driver for the "audit-journal replay correctness against a known
+// trace" invariant. Verifies the library-observable pieces of the
+// wire-format contract that a supervisor replaying the audit journal
+// would need to hold byte-for-byte: state-machine transitions, hash
+// primitives, spec constants, and parent-child linkage propagation
+// into the marshalling scratch.
+//
+// The byte-for-byte marshalling verification (audit_payload_scratch
+// vs. tests/goldens/trace_001.md) requires audit_send_record to run,
+// which invokes sys_ipc_send — a live kernel call. Since libpdx-audit
+// is a shared library with no runnable executable of its own and the
+// kernel-side audit_journal_broker_dispatch is still stubbed
+// (AJB_DISPATCH_STUB), that verification lives in the QEMU smoke
+// matrix once a consumer tool (pkg/shell) hosts the driver. This
+// file covers what can be verified from the library's own type +
+// memory surface: the state machine + hash + parent-slot invariants
+// that MUST hold before the marshalling step runs.
+//
+// Return convention (identical to test_broker_refusal.pdx):
+//
+//   0                       — all subtests passed.
+//   1..N (small u64)         — failing subtest ordinal.
+//
+// Effects `!{mem} @{}` — pure .bss read/write across reset(),
+// audit_hash_init/update/finalize, audit_set_parent. No syscall.
+//
+// See tests/goldens/trace_001.md for the wire-bytes fixture the QEMU
+// harness compares audit_payload_scratch against. See design/
+// architecture.md §13 for the test discipline this file lives under.
+//
+// Cross-module functions called:
+//   AuditRecord::reset               (src/audit_record.pdx)
+//   AuditHash::audit_hash_init       (src/audit_hash.pdx, M3-001)
+//   AuditHash::audit_hash_update     (src/audit_hash.pdx, M3-001)
+//   AuditHash::audit_hash_finalize   (src/audit_hash.pdx, M3-001)
+//   AuditClient::audit_set_parent    (src/audit_client.pdx, M3-002)
+// Cross-module .bss symbols read/written:
+//   record_state                     (src/audit_record.pdx)
+//   record_hash_state                (src/audit_record.pdx, M3-001)
+//   record_hash_active               (src/audit_record.pdx, M3-001)
+//   record_parent_audit_id           (src/audit_record.pdx, M3-002)
+//   audit_broker_slot                (src/audit_record.pdx)
+
+module TestReplayGolden = structure {
+
+  // ============================================================================
+  // The M4-002 "no-op update" fixture pointer target. A u64 scratch
+  // slot the update-len=0 and update-inactive subtests point at; the
+  // gates fire before any byte is loaded, so the slot's content is
+  // irrelevant. Declared as u64 (rather than u8) to match every other
+  // .bss slot in this repo — the pattern `pub let mut X : u64 = uninit
+  // @align(8)` is the only .bss shape libpdx-audit exercises so far,
+  // and staying inside it keeps this test file's paideia-as encoding
+  // identical to every other module. Kept in .bss (zero-init).
+  // ============================================================================
+  pub let mut trg_null_scratch : u64 = uninit @align(8)
+
+  // ============================================================================
+  // run() -> u64
+  //
+  // Executes the M4-002 subtest sequence in order. Returns 0 on all-pass
+  // or the ordinal of the first failing subtest (1..8).
+  //
+  // Subtest ledger:
+  //
+  //   1  reset()          -> record_state = IDLE (0)
+  //   2  audit_hash_init()  then audit_hash_finalize() with NO update
+  //      calls between them returns FNV_OFFSET_BASIS (0xcbf29ce484222325)
+  //      — the FNV-1a-64 empty-stream self-check. This is the canonical
+  //      known-vector for the M3-001 primitive and does not require
+  //      byte-level FNV arithmetic to verify. (See RFC-1321-style FNV
+  //      spec: h_final(empty) = FNV_OFFSET_BASIS.)
+  //   3  after finalize, record_hash_active is cleared to 0
+  //   4  audit_hash_update called BEFORE any init returns
+  //      AUDIT_ERR_HASH_INACTIVE (5) — defence-in-depth gate.
+  //   5  audit_hash_init then audit_hash_update(ptr, 0) returns
+  //      AUDIT_OK (0) — len=0 is a legal no-op.
+  //   6  after the len=0 update, record_hash_state remains
+  //      FNV_OFFSET_BASIS — the no-op did not touch the accumulator.
+  //   7  audit_set_parent(0x1234567) with record_state = IDLE
+  //      returns AUDIT_OK (0) and record_parent_audit_id becomes
+  //      0x1234567 — the M3-002 parent-linkage propagation into
+  //      the .bss slot that audit_send_record marshals at index [7].
+  //   8  audit_set_parent called with record_state != IDLE (fault-
+  //      inject record_state = 1 = BEGUN) returns AUDIT_ERR_STATE
+  //      (1) — parent linkage cannot be mutated mid-flight per
+  //      design/architecture.md §12.1.
+  //
+  // Register plan (leaf; two calls that take args need arg preservation
+  // across ONE call each — no state shared between call sites):
+  //   rax = call returns / .bss loads
+  //   r11 = LEA scratch
+  //   r12 = ordinal marker across subtests (SysV callee-save, pushed).
+  //   r13 = FNV_OFFSET_BASIS staged for the two u64 compares that need
+  //         it (SysV callee-save, pushed for alignment parity).
+  //
+  // Every immediate fits inside the paideia-as 0x7FFFFFFF cmp-imm bound.
+  // FNV_OFFSET_BASIS (0xcbf29ce484222325) exceeds it but is loaded via
+  // MOVABS into r13 then compared reg-to-reg — a valid encoding path.
+  // ============================================================================
+
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M4-002: TestReplayGolden::run entry point. Sequential subtest driver: eight .bss-and-API-only checks covering the state-machine reset invariant, the FNV-1a-64 empty-stream self-check (M3-001 known-vector: h_final(empty) = FNV_OFFSET_BASIS 0xcbf29ce484222325 — matches the RFC-style FNV spec exactly and requires no byte arithmetic to verify), the hash active-flag gates (subtests 3+4), the len=0 no-op path (subtests 5+6), and the parent-linkage state-gate contract (subtests 7+8). Subtest 4 relies on the M3-001 defence-in-depth invariant: calling audit_hash_update without a prior audit_hash_init returns AUDIT_ERR_HASH_INACTIVE=5 rather than silently folding bytes into the .bss zero baseline. Subtest 7 exercises the M3-002 audit_set_parent → record_parent_audit_id propagation directly; the .bss slot is what AuditBroker::audit_send_record marshals into payload index [7] on every INVOKE/OUTPUT/EXIT, so verifying it holds the caller-passed value proves the wire-format handoff. Subtest 8 verifies the IDLE gate on audit_set_parent (record_state != IDLE → AUDIT_ERR_STATE) — parent linkage is a property of the audit's identity per design/architecture.md §12.1. FNV_OFFSET_BASIS staged in r13 via MOVABS since 0xcbf29ce484222325 > 0x7FFFFFFF cmp-imm bound; reg-to-reg compare via `cmp rax, r13`. Fault-injection for subtest 8 writes 1 (AUDIT_STATE_BEGUN) into record_state via `lea r11,[rip+record_state]; mov [r11],rax` (parser.pdx cross-module-write pattern) — bypassing audit_begin lets the driver test audit_set_parent's gate without invoking the sys_ipc_send that audit_begin would trigger. Every callee here is a pure leaf (reset, audit_hash_init/update/finalize, audit_set_parent all declared !{mem} @{}) so no register state needs preservation beyond r12/r13 (pushed as a pair for SysV callee-save + rsp % 16 alignment). Label prefix trg_ per project reserved-label discipline. Return code: 0 on all-pass, 1..8 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (state IDLE / AUDIT_OK / .bss zero), 1 (state BEGUN / AUDIT_ERR_STATE fault-inject value), 2..8 (subtest ordinals), 5 (AUDIT_ERR_HASH_INACTIVE), 0x1234567 (parent-id sentinel — 25-bit value, well within 0x7FFFFFFF cmp-imm bound and encodable as MOVABS or 32-bit imm for the .bss write). FNV_OFFSET_BASIS (0xcbf29ce484222325) is 64-bit — loaded via MOVABS into r13 and used only in reg-to-reg cmp. All within paideia-as encoding gates.",
+      block: {
+        push r12;
+        push r13;
+
+        // Stage FNV_OFFSET_BASIS in r13 once; used at subtests 2 and 6.
+        // MOVABS encoding — the constant exceeds the cmp-imm bound.
+        mov r13, 0xcbf29ce484222325;             // FNV_OFFSET_BASIS
+
+        // ---- Subtest 1: reset() → record_state = IDLE (0). -----------
+        call reset;
+        lea r11, [rip + record_state];
+        mov rax, [r11];
+        cmp rax, 0;                              // AUDIT_STATE_IDLE
+        jne trg_fail_1;
+
+        // ---- Subtest 2: hash empty-stream self-check. ----------------
+        //      init() + finalize() with no update() calls between must
+        //      return FNV_OFFSET_BASIS (the M3-001 known vector).
+        call audit_hash_init;
+        call audit_hash_finalize;
+        cmp rax, r13;                            // rax == FNV_OFFSET_BASIS ?
+        jne trg_fail_2;
+
+        // ---- Subtest 3: finalize clears record_hash_active. ----------
+        lea r11, [rip + record_hash_active];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne trg_fail_3;
+
+        // ---- Subtest 4: update-before-init returns HASH_INACTIVE. ----
+        //      reset() cleared record_hash_active; finalize left it 0.
+        //      Any update now must refuse. Args: rdi = &trg_null_scratch
+        //      (real .bss address; content irrelevant — the gate fires
+        //      before the byte load), rsi = 8 (non-zero len so we don't
+        //      hit the len=0 no-op path first).
+        lea rdi, [rip + trg_null_scratch];
+        mov rsi, 8;
+        call audit_hash_update;
+        cmp rax, 5;                              // AUDIT_ERR_HASH_INACTIVE
+        jne trg_fail_4;
+
+        // ---- Subtest 5: init + update(ptr, 0) returns AUDIT_OK. ------
+        call audit_hash_init;
+        lea rdi, [rip + trg_null_scratch];
+        mov rsi, 0;                              // len=0 no-op
+        call audit_hash_update;
+        cmp rax, 0;                              // AUDIT_OK
+        jne trg_fail_5;
+
+        // ---- Subtest 6: len=0 no-op leaves state = FNV_OFFSET_BASIS. -
+        lea r11, [rip + record_hash_state];
+        mov rax, [r11];
+        cmp rax, r13;                            // still FNV_OFFSET_BASIS ?
+        jne trg_fail_6;
+
+        // ---- Reset before the parent-linkage subtests so record_state
+        //      is guaranteed IDLE.
+        call reset;
+
+        // ---- Subtest 7: audit_set_parent(0x1234567) with IDLE state
+        //      returns AUDIT_OK and writes the value to the .bss slot.
+        mov rdi, 0x1234567;                      // canonical parent id
+        call audit_set_parent;
+        cmp rax, 0;                              // AUDIT_OK
+        jne trg_fail_7;
+
+        lea r11, [rip + record_parent_audit_id];
+        mov rax, [r11];
+        cmp rax, 0x1234567;
+        jne trg_fail_7;
+
+        // ---- Subtest 8: audit_set_parent with state != IDLE refuses. -
+        //      Fault-inject record_state = 1 (AUDIT_STATE_BEGUN) via
+        //      direct .bss write, bypassing audit_begin (which would
+        //      call sys_ipc_send). audit_set_parent must return
+        //      AUDIT_ERR_STATE (1) per design/architecture.md §12.1.
+        mov rax, 1;                              // AUDIT_STATE_BEGUN
+        lea r11, [rip + record_state];
+        mov [r11], rax;
+
+        mov rdi, 0x89ABCDE;                      // a different parent id
+        call audit_set_parent;
+        cmp rax, 1;                              // AUDIT_ERR_STATE
+        jne trg_fail_8;
+
+        // Restore state to IDLE so a subsequent driver run starts clean.
+        call reset;
+
+        // All subtests passed.
+        xor rax, rax;                            // 0 = all pass
+        pop r13;
+        pop r12;
+        ret
+
+      trg_fail_1:
+        mov rax, 1;
+        pop r13;
+        pop r12;
+        ret
+
+      trg_fail_2:
+        mov rax, 2;
+        pop r13;
+        pop r12;
+        ret
+
+      trg_fail_3:
+        mov rax, 3;
+        pop r13;
+        pop r12;
+        ret
+
+      trg_fail_4:
+        mov rax, 4;
+        pop r13;
+        pop r12;
+        ret
+
+      trg_fail_5:
+        mov rax, 5;
+        pop r13;
+        pop r12;
+        ret
+
+      trg_fail_6:
+        mov rax, 6;
+        pop r13;
+        pop r12;
+        ret
+
+      trg_fail_7:
+        mov rax, 7;
+        pop r13;
+        pop r12;
+        ret
+
+      trg_fail_8:
+        mov rax, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

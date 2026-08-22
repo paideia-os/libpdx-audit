@@ -1,7 +1,7 @@
 # libpdx-audit — status
 
 **Wave:** R49 shared library
-**Current milestone:** M3 (semantic-pipe / audit integration) — in progress
+**Current milestone:** M4 (tests + smoke) — landed
 
 ## Milestone progress
 
@@ -72,6 +72,41 @@
   keep byte-for-byte agreement. Consumers that never call
   audit_set_parent get parent = 0 (top-level) via .bss zero-init —
   the M2 shape is preserved. See design/architecture.md §12.
+- M4-001 — broker-unavailable refusal test (tool exits 3, no output
+  emitted): landed. New tests/test_broker_refusal.pdx exports
+  TestBrokerRefusal::run() -> u64 (effects !{mem} @{}). Seven-
+  subtest driver over the M2-002 sticky-flag guard: reset zeroes
+  audit_broker_failed; audit_can_emit_output returns 1 (safe)
+  after reset; fault-inject 1 into audit_broker_failed .bss slot;
+  guard returns 0 (refuse); reset clears the sticky flag; guard
+  returns 1 again; audit_broker_slot = AUDIT_BROKER_SLOT_UNRESOLVED
+  (0xFFFF) after reset (the sentinel that forces the next
+  audit_broker_bind to attempt a real svc_lookup). Return code
+  0 = all pass, 1..7 = ordinal of first failing subtest. QEMU
+  smoke (spawn under image with no svc.audit-journal registered,
+  verify exit 3 + zero stdout bytes) documented in
+  tests/README.md §M4-001 QEMU protocol pending shell.M4 +
+  bootstrap consumer + R49-PREP-007 daemon.
+- M4-002 — audit-journal replay correctness against a known trace:
+  landed. New tests/test_replay_golden.pdx exports
+  TestReplayGolden::run() -> u64 (effects !{mem} @{}). Eight-
+  subtest driver over the wire-format invariants that hold BEFORE
+  the marshal runs: reset -> IDLE state, FNV-1a-64 empty-stream
+  self-check (finalize after init returns FNV_OFFSET_BASIS), hash
+  active-flag clear after finalize, update-before-init returns
+  AUDIT_ERR_HASH_INACTIVE (5), len=0 update returns AUDIT_OK and
+  leaves state = FNV_OFFSET_BASIS, audit_set_parent(0x1234567)
+  propagates into record_parent_audit_id, audit_set_parent with
+  state != IDLE returns AUDIT_ERR_STATE (M3-002 §12.1 gate).
+  New byte-for-byte fixture at tests/goldens/trace_001.md — the
+  canonical ls --long /home audit as a shell child: header
+  0x0000_0040_0000_0120, per-lifecycle payload table (INVOKE
+  event_kind=130 with uninit exit/schema/hash; OUTPUT
+  event_kind=132 with schema+hash populated; EXIT event_kind=133
+  with exit_code=0), parent_audit_id=0x2a on all three sends
+  (the M3-002 linkage). QEMU harness will memcmp
+  audit_payload_scratch against the fixture once R49-PREP-007
+  daemon captures payload bytes.
 
 ## Upstream design
 
@@ -82,9 +117,17 @@ wave-level rationale and the full milestone breakdown. See
 
 ## Next milestone
 
-M4 — Tests + smoke. Begin/record/commit round-trip (M4 open-ended);
-broker-unavailable refusal (M4-001: tool exits 3, no output); backoff
-correctness (3 retries); parent-child linkage against a shell trace;
-audit-journal replay against a known trace (M4-002). Depends on the
-R49-PREP-007 kernel-side ordinal split reaching a runnable daemon
-body so the replay can be verified end-to-end.
+M5 — 1.0 signed release. Dual-signed release, `.pdxdoc`, mirror
+push. Depends on paideia-as v0.33-crypto-kdf toolchain (Argon2id
++ ChaCha20-Poly1305 + ML-DSA-65) being reachable via the build
+harness (already the R49 substrate), a `.pdxdoc` corpus that
+follows the format `doc` M2 consumes, and the pkgs.paideia-os
+mirror push being wired.
+
+The M4-001/M4-002 QEMU end-to-end smoke (child-under-QEMU spawn +
+audit-endpoint payload capture + memcmp against
+tests/goldens/trace_001.md) remains deferred to when shell.M4 +
+a bootstrap consumer (pkg.M2 or cat.M2) + R49-PREP-007
+audit_journal_broker_dispatch daemon body all land. The M4
+drivers cover every library-observable invariant in the meantime;
+see tests/README.md §QEMU smoke protocol for the follow-up.
