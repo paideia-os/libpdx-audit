@@ -22,6 +22,12 @@
   to !{mem, sysreg} @{cap, sched}. UEJ_KIND_TOOL_OUTPUT (132) and
   EXIT (133) forward-declared pending R49-PREP-007 kernel-side
   ordinal split.
+- M2-002 — failure semantics: broker unreachable → tool refuses
+  output (exit 3): landed. Sticky AuditRecord::audit_broker_failed
+  slot set to 1 on any audit_send_record failure (bind or send).
+  New AuditClient::audit_can_emit_output() -> u64 helper reads the
+  slot; returns 1 when safe, 0 when the consumer must exit 3 per I4
+  without emitting output. reset() clears the flag.
 
 ## Upstream design
 
@@ -30,7 +36,6 @@
 wave-level rationale and the full milestone breakdown. See
 `design/architecture.md` in this repo for the internal shape.
 
-## Next milestones
+## Next milestone
 
-- M2-002 broker-unreachable refusal (tool exits 3, no output).
 - M2-003 retry-with-backoff (bounded 3 retries then hard-fail on EAGAIN).

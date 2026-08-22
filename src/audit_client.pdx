@@ -1,4 +1,4 @@
-// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002 + M2-001
+// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002 + M2-001 + M2-002
 // AuditClient: three-call user-facing API — audit_begin, audit_record_
 // output, audit_commit. State-machine gating per design/architecture.md
 // §4; wire format per §2. M1-002 stitched the send path in at commit;
@@ -20,7 +20,8 @@
 // Cross-module symbols read/written (all in AuditRecord .bss):
 //   audit_id_next, record_audit_id, record_op_name_ptr,
 //   record_op_args_ptr, record_output_schema_ptr, record_output_hash,
-//   record_exit_code, record_state
+//   record_exit_code, record_state, audit_broker_failed (M2-002 read
+//   in audit_can_emit_output)
 // Cross-module functions called (M2-001):
 //   audit_send_record  (src/audit_broker.pdx)
 // Resolved by unqualified linker name — the same pattern
@@ -253,6 +254,57 @@ module AuditClient = structure {
         mov [r11], rcx;
 
       audit_commit_done:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_can_emit_output() -> u64
+  //   rax = 1 iff it is safe for the consumer to write to stdout/stderr
+  //       | 0 iff the consumer MUST exit 3 (per I4) without emitting
+  //             any user-visible output.
+  //
+  // M2-002 guard. Consumers wrap every user-visible write with a
+  // pre-check on this — the D3 audit-first invariant says a tool whose
+  // audit trail was not journalled cannot be trusted, so its output
+  // must be suppressed. Cheap: one .bss load + one compare.
+  //
+  // Returns 0 if the sticky AuditRecord::audit_broker_failed flag has
+  // been set by any prior audit_send_record failure (either broker-
+  // unreachable at bind time or sys_ipc_send returning non-zero); this
+  // is the "refuse output" signal. Returns 1 otherwise. .bss zeroing
+  // means the flag reads 0 (safe) before any send has been attempted;
+  // a caller who invokes audit_can_emit_output before audit_begin gets
+  // the correct "no prior failure" answer.
+  //
+  // Consumers typically wire this as:
+  //
+  //     let id = AuditClient::audit_begin(op_name, op_args)
+  //     if id == 0 { sys_exit(3) }                    // begin failed
+  //     … tool does its work …
+  //     if AuditClient::audit_can_emit_output() == 0 {
+  //         sys_exit(3)                                // refuse output
+  //     }
+  //     … tool emits output …
+  //
+  // No callee-save touched — pure leaf.
+  // ============================================================================
+
+  pub let audit_can_emit_output : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M2-002: audit_can_emit_output guard. One .bss load of AuditRecord::audit_broker_failed via `lea r11,[rip+audit_broker_failed]; mov rax,[r11]`; then `cmp rax, 0` (no test mnemonic per paideia-as conformance). On flag == 0 return 1 (safe to emit output); on flag != 0 return 0 (refuse output, exit 3 per I4). Pure leaf — no callee-save touched, no push/pop. Register plan: rax = flag-load / return, r11 = LEA scratch. Effects `!{mem} @{}` — only a .bss read, no syscall, no cap consumption. Immediates: 0 (flag compare) + 1 (safe return value) — both within paideia-as cmp-imm bounds.",
+      block: {
+        lea r11, [rip + audit_broker_failed];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne audit_cee_no;
+
+        mov rax, 1;                              // safe to emit output
+        ret
+
+      audit_cee_no:
+        xor rax, rax;                            // refuse output (exit 3)
         ret
       }
     }

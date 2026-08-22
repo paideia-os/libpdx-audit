@@ -65,6 +65,15 @@ module AuditRecord = structure {
   pub let mut record_state             : u64 = uninit @align(8)
   pub let mut audit_broker_slot        : u64 = uninit @align(8)
 
+  // M2-002 sticky failure flag. Written to 1 the first time any send
+  // path (audit_begin's INVOKE, audit_record_output's OUTPUT, or
+  // audit_commit's EXIT) fails; consumers read it via
+  // AuditClient::audit_can_emit_output() to gate every stdout/stderr
+  // write per D3 audit-first (I4). Once set, only reset() clears it —
+  // there is no in-flight recovery path in M2. .bss zero-initialised
+  // (0 = healthy, 1 = failed).
+  pub let mut audit_broker_failed      : u64 = uninit @align(8)
+
   // --- M1 send-time payload scratch. `.bss` again; 56 bytes = one
   //     wire record. audit_commit memcpy-fills this before sys_ipc_send.
   //     Sized in u64 words so paideia-as encodes it as an aligned array
@@ -80,7 +89,7 @@ module AuditRecord = structure {
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M1-001 + M1-002: zero the eight in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-audit.M1-001 + M1-002 + M2-002: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
       block: {
         xor rax, rax;                                    // rax = 0
         lea r11, [rip + record_audit_id];          mov [r11], rax;
@@ -90,6 +99,7 @@ module AuditRecord = structure {
         lea r11, [rip + record_output_hash];       mov [r11], rax;
         lea r11, [rip + record_exit_code];         mov [r11], rax;
         lea r11, [rip + record_state];             mov [r11], rax;
+        lea r11, [rip + audit_broker_failed];      mov [r11], rax;
 
         mov rax, 1;                                      // audit_id_next = 1
         lea r11, [rip + audit_id_next];            mov [r11], rax;
