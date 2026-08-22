@@ -23,9 +23,28 @@ module AuditRecord = structure {
   //     ([0..255]) so a raw eq/ne comparison discriminates cleanly. ------
   pub let AUDIT_BROKER_SLOT_UNRESOLVED : u64 = 0xFFFF
 
-  // --- M1 wire format sizes (see design/architecture.md §2). -----------
+  // --- Wire format sizes (see design/architecture.md §2). --------------
   pub let AUDIT_PAYLOAD_BYTES : u64 = 56   // seven u64 words
   pub let AUDIT_HDR_WORD      : u64 = 0x0000003800000120  // op=0x20 | ver=1 | reply_ep=0 | payload_len=56
+
+  // --- M2-001 lifecycle event kinds. Written at payload index [1] by
+  //     AuditBroker::audit_send_record so a supervisor replay can
+  //     discriminate the three phases of a single audit.
+  //
+  //     UEJ_KIND_TOOL_INVOKE (130) matches the kernel-side ordinal at
+  //     src/kernel/core/ipc/audit_journal_broker.pdx in paideia-os.
+  //     OUTPUT (132) and EXIT (133) are forward-declared here pending
+  //     the R49-PREP-007 kernel-side ordinal split (see plan.md §5.13
+  //     "libpdx-audit.M2 also depends on the R49-PREP-006 event
+  //     constants splitting into UEJ_KIND_TOOL_INVOKE/OUTPUT/EXIT ...
+  //     the split is deferred to R49-PREP-007"). The daemon body is
+  //     still stubbed (audit_journal_broker_dispatch returns
+  //     AJB_DISPATCH_STUB) so transport-layer sys_ipc_send does not
+  //     validate the event_kind field; when R49-PREP-007 lands the
+  //     ordinals here reconcile with kernel-side by matching value. -----
+  pub let UEJ_KIND_TOOL_INVOKE : u64 = 130
+  pub let UEJ_KIND_TOOL_OUTPUT : u64 = 132
+  pub let UEJ_KIND_TOOL_EXIT   : u64 = 133
 
   // --- Singleton storage (bootstrap-scope; M3-002 migrates to caller-
   //     owned when nested audits arrive). --------------------------------
