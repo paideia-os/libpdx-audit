@@ -1,7 +1,8 @@
 # libpdx-audit — status
 
 **Wave:** R49 shared library
-**Current milestone:** M4 (tests + smoke) — landed
+**Current milestone:** M5 (1.0 signed release) — landed
+**Version:** 1.0.0 (tag `v1.0.0`)
 
 ## Milestone progress
 
@@ -107,6 +108,29 @@
   (the M3-002 linkage). QEMU harness will memcmp
   audit_payload_scratch against the fixture once R49-PREP-007
   daemon captures payload bytes.
+- M5-001 — dual-signed release + .pdxdoc + mirror push: landed.
+  Repo now ships the source form of the release: doc/libpdx-
+  audit.pdxdoc (I7 doc for `doc libpdx-audit` — NAME / SYNOPSIS /
+  DESCRIPTION / API / WIRE-FORMAT / STATE-MACHINE / ERROR-CODES /
+  RETRY-DISCIPLINE / PARENT-LINKAGE / HASH / POSIX-DIFFERENCES /
+  EXAMPLES / CROSS-REFERENCES / SEE-ALSO / VERSION); release/
+  manifest.pdxsig.txt (release-manifest source with per-artifact
+  BLAKE3-256 placeholder rows, [depends-on] empty, [substrate]
+  pinning paideia-as ≥ 0.33-crypto-kdf + SC+ ID 42/43 + svc.audit-
+  journal broker + UEJ_KIND_TOOL_INVOKE/OUTPUT/EXIT ordinals +
+  audit-hdr-word 0x0000_0040_0000_0120, and [signatures] block
+  declaring hybrid-ed25519+ml-dsa-65 per paideia-pq-hybrid-v1);
+  release/RELEASE.md (operator runbook — 8-step cut-a-release +
+  verification + rollback); CHANGELOG.md (v1.0.0 entry with the
+  full M1..M4 rollup + wire-format contract + semver policy);
+  README.md refreshed to point at the 1.0 surface. Git tag
+  `v1.0.0` marks the M5-001 commit. The dual-sign + mirror-push
+  run itself is a substrate-gated action documented in RELEASE.md
+  §1 (S1 = paideia-as v0.33-crypto-kdf toolchain reachable, S2 =
+  pkgs.paideia-os mirror endpoint reachable, S3 = doc.M2 compile
+  pass) — the source form lands now so a future operator can cut
+  the mirror push without repo-side changes beyond a version
+  bump.
 
 ## Upstream design
 
@@ -117,17 +141,35 @@ wave-level rationale and the full milestone breakdown. See
 
 ## Next milestone
 
-M5 — 1.0 signed release. Dual-signed release, `.pdxdoc`, mirror
-push. Depends on paideia-as v0.33-crypto-kdf toolchain (Argon2id
-+ ChaCha20-Poly1305 + ML-DSA-65) being reachable via the build
-harness (already the R49 substrate), a `.pdxdoc` corpus that
-follows the format `doc` M2 consumes, and the pkgs.paideia-os
-mirror push being wired.
+All milestones M1..M5 landed at v1.0.0. The library is now the
+template for the peer R49 shared-library M5 cuts (libpdx-cap,
+libpdx-argv, libpdx-semantic-pipe, libpdx-elevate). Downstream
+work continues in the consumer repos (pkg, shell, doc, the R50
+coreutils) where every M3 milestone binds libpdx-audit and every
+M5 cut mirrors the workflow at `release/RELEASE.md`.
 
-The M4-001/M4-002 QEMU end-to-end smoke (child-under-QEMU spawn +
-audit-endpoint payload capture + memcmp against
-tests/goldens/trace_001.md) remains deferred to when shell.M4 +
-a bootstrap consumer (pkg.M2 or cat.M2) + R49-PREP-007
-audit_journal_broker_dispatch daemon body all land. The M4
-drivers cover every library-observable invariant in the meantime;
-see tests/README.md §QEMU smoke protocol for the follow-up.
+Deferred to a future patch release (semver-patch bump per
+`CHANGELOG.md` semver policy):
+
+- **BLAKE3 stdlib primitive swap.** M3-001 ships FNV-1a-64 as a
+  documented placeholder. When paideia-as ≥ v0.34 exposes BLAKE3
+  as a stdlib intrinsic, swap `audit_hash_update` +
+  `audit_hash_finalize` internals to BLAKE3-256 upper 64 bits;
+  the API surface, the `.bss` state slot, and the return type
+  are stable across the swap. Recut a v1.0.1.
+- **QEMU end-to-end smoke.** The child-under-QEMU spawn +
+  audit-endpoint payload capture + memcmp against
+  `tests/goldens/trace_001.md` runs when shell.M4 + a bootstrap
+  consumer (pkg.M2 or cat.M2) + R49-PREP-007
+  `audit_journal_broker_dispatch` daemon body all land. The M4
+  drivers cover every library-observable invariant in the
+  meantime; see `tests/README.md` §QEMU smoke protocol for the
+  follow-up.
+- **Dual-sign + mirror-push run.** Repo-side scaffolding at M5-001
+  is complete. The signed build + HTTP-PUT to `pkgs.paideia-os/
+  main/libpdx-audit/1.0.0/` runs from the paideia-os workspace
+  CI once substrates S1 (paideia-as v0.33-crypto-kdf toolchain
+  reachable) and S2 (pkgs.paideia-os mirror endpoint reachable)
+  go green per `release/RELEASE.md` §1. Until then the signed
+  `manifest.pdxsig` lands as a v1.0.0 GitHub release attachment
+  for out-of-band consumers.

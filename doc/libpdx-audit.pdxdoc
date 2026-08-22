@@ -1,0 +1,250 @@
+%%% pdxdoc-source v0.1
+%%% This is the source form of the .pdxdoc file that `doc libpdx-audit`
+%%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
+%%% §5.3); the M5-001 source lives in the repo under version control
+%%% and the release tool ships the compiled `.pdxdoc` alongside the
+%%% library into /pkgs/libpdx-audit-1.0.0/doc/libpdx-audit.pdxdoc.
+%%%
+%%% Section markers: a bare `==== <title>` line opens a section. Cross-
+%%% references use `[[cref: <target>]]` where <target> is either a
+%%% doc-local section title or a `<tool>#<section>` fully-qualified
+%%% reference the reader resolves against /system/doc/. POSIX-difference
+%%% annotations use a `[[posix: <difference>]]` inline tag.
+
+==== NAME
+libpdx-audit — audit-first output for paideia-os tools.
+
+==== SYNOPSIS
+    module AuditRecord = structure { ... }
+    module AuditClient = structure {
+      pub let audit_begin        : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
+      pub let audit_record_output: (u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
+      pub let audit_commit       : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
+      pub let audit_set_parent   : (u64) -> u64 !{mem} @{}
+      pub let audit_can_emit_output : () -> u64 !{} @{}
+    }
+    module AuditHash = structure {
+      pub let audit_hash_init     : () -> u64 !{mem} @{}
+      pub let audit_hash_update   : (u64, u64) -> u64 !{mem} @{}
+      pub let audit_hash_finalize : () -> u64 !{mem} @{}
+    }
+    module AuditBroker = structure {
+      pub let audit_broker_bind   : () -> u64 !{mem, sysreg} @{cap}
+      pub let audit_send_record   : (u64) -> u64 !{mem, sysreg} @{cap, sched}
+    }
+
+==== DESCRIPTION
+libpdx-audit is the paideia-os shared library that enforces the D3
+audit-first contract: every operation — read as well as write — journals
+to `svc.audit-journal` BEFORE it emits any user-visible output. Every
+R49/R50 tool links against this library, opens one top-level audit at
+_start, records it as work progresses, and commits it before sys_exit.
+On any failure of the audit path the tool refuses to emit output and
+exits 3 (I4 system-error).
+
+The library ships as three modules — `AuditClient`, `AuditHash`,
+`AuditBroker` — over a single `.bss`-resident `AuditRecord` singleton.
+The singleton pattern (one audit-in-flight per process at M1..M4) is
+deliberate for bootstrap: zero heap dependency, deterministic linkage,
+one broker slot cached across every commit in the process. Nested audits
+(shell parenting child tools) use `audit_set_parent` at M3-002 to thread
+`parent_audit_id` through the wire format; multi-audit-per-process (a
+caller-owned `AuditRecord*` variant) lands post-M5 when a consumer needs
+it.
+
+See [[cref: WIRE-FORMAT]] for the on-wire event schema, [[cref: STATE-
+MACHINE]] for the audit_begin/record_output/commit gating, and [[cref:
+RETRY-DISCIPLINE]] for the bounded-retry behaviour on broker EAGAIN.
+
+==== API
+
+---- audit_begin(op_name_ptr, op_args_ptr) -> audit_id
+Open a new audit. `op_name_ptr` MUST be non-zero; `op_args_ptr` may be
+zero when the tool has no argv beyond op_name. Returns the newly-
+allocated `audit_id` (u64 > 0) on success, or 0 on failure (state gate
+or send failure — see [[cref: ERROR-CODES]]). On success transitions
+`record_state` IDLE → BEGUN and issues an INVOKE event to the broker.
+
+---- audit_record_output(audit_id, output_schema_ptr, output_hash) -> err
+Record that a schema-typed output stream is about to be emitted. Called
+after any use of the streaming hash API ([[cref: HASH]]) — `output_hash`
+is typically the return value of `audit_hash_finalize()`. `audit_id`
+MUST equal the id returned by the matching `audit_begin`. Optional — a
+read-only tool that emits no schema-typed output may skip this and go
+straight to commit. On success transitions BEGUN → OUTPUT and issues an
+OUTPUT event.
+
+---- audit_commit(audit_id, exit_code) -> err
+Close the audit. Legal from BEGUN or OUTPUT; on success transitions to
+COMMITTED, issues an EXIT event, then resets to IDLE so a subsequent
+`audit_begin` in the same process starts a fresh record.
+
+---- audit_set_parent(parent_audit_id) -> err
+Set the parent audit id for the next `audit_begin`. Legal ONLY from
+IDLE — parent linkage is a property of the audit's identity and cannot
+be mutated mid-flight. Consumers that skip this call get parent = 0
+(top-level) via `.bss` zero-init. The shell binds its per-command
+`ShellCommandRecord`'s audit_id here before spawning each child tool
+(paideia-os plan §5.2, shell.M3-003).
+
+---- audit_can_emit_output() -> safe
+Query the sticky broker-failure flag. Returns 1 when the tool may emit
+output; 0 when a prior audit send failed and the tool MUST NOT emit any
+user-visible output — the caller exits 3. Reset by `AuditRecord::reset`.
+
+---- audit_hash_init / update / finalize
+Streaming digest over the tool's output stream. M3-001 ships FNV-1a-64
+as a documented placeholder; the primitive swaps to BLAKE3-truncated
+when paideia-as v0.33+ exposes BLAKE3 as a stdlib intrinsic ([[cref:
+HASH]]). The API surface, the `.bss` state slot, and the return type
+are stable across the swap.
+
+==== WIRE-FORMAT
+Every lifecycle send (INVOKE at begin, OUTPUT at record_output, EXIT at
+commit) marshals a fixed 64-byte payload of eight u64 words to the
+kernel `sys_ipc_send` handler:
+
+    [0] audit_id                        (record_audit_id)
+    [1] event_kind                      (UEJ_KIND_TOOL_INVOKE=130 |
+                                         UEJ_KIND_TOOL_OUTPUT=132 |
+                                         UEJ_KIND_TOOL_EXIT=133)
+    [2] exit_code                       (record_exit_code; 0 outside EXIT)
+    [3] op_name_ptr                     (caller-owned NUL-terminated)
+    [4] op_args_ptr                     (caller-owned NUL-terminated; 0 ok)
+    [5] output_schema_ptr               (0 outside OUTPUT+)
+    [6] output_hash                     (audit_hash_finalize return)
+    [7] parent_audit_id                 (M3-002; 0 for top-level)
+
+The IPC header word is `0x0000_0040_0000_0120` — op = 0x20
+(AUDIT_EVENT), ver = 1, reply_endpoint_id = 0 (fire-and-forget),
+payload_len = 64. Grew from 56 bytes at M2 to 64 at M3-002 when
+`parent_audit_id` landed at index [7].
+
+Pointer indices ([3], [4], [5]) reference caller-owned memory. The
+consumer MUST keep those pages alive from `audit_begin` through
+`audit_commit`; the lifetimes match a single tool invocation.
+
+The byte-for-byte fixture at `tests/goldens/trace_001.md` documents the
+canonical `/bin/ls --long /home` audit trace as a shell child (parent_
+audit_id = 0x2a).
+
+==== STATE-MACHINE
+`record_state` transitions:
+
+                       audit_begin
+      AUDIT_STATE_IDLE ────────────▶ AUDIT_STATE_BEGUN
+                                      │
+                                      │ audit_record_output (optional)
+                                      ▼
+                                    AUDIT_STATE_OUTPUT
+                                      │
+                                      │ audit_commit
+                                      ▼
+                                    AUDIT_STATE_COMMITTED
+                                      │
+                                      │ (reset to IDLE on send return)
+                                      ▼
+                                    AUDIT_STATE_IDLE
+
+Every entry point validates the state gate BEFORE the audit_id gate;
+this ordering surfaces a stale `audit_id` passed after commit as
+`AUDIT_ERR_STATE`, not `AUDIT_ERR_ID_MISMATCH`.
+
+==== ERROR-CODES
+    AUDIT_OK                    = 0
+    AUDIT_ERR_STATE             = 1   State-machine gate refused.
+    AUDIT_ERR_ID_MISMATCH       = 2   audit_id != record_audit_id.
+    AUDIT_ERR_BROKER_UNAVAILABLE= 3   svc_lookup for svc.audit-journal
+                                      returned EINVAL/EFAULT/ENOENT/ENOSPC.
+    AUDIT_ERR_SEND_FAILED       = 4   sys_ipc_send retries exhausted or a
+                                      non-EAGAIN failure. Sets sticky
+                                      `audit_broker_failed`; caller MUST
+                                      check `audit_can_emit_output` before
+                                      any output.
+    AUDIT_ERR_HASH_INACTIVE     = 5   audit_hash_update called without a
+                                      prior audit_hash_init.
+
+==== RETRY-DISCIPLINE
+`audit_send_record` wraps `sys_ipc_send` in a bounded retry loop: 3
+attempts on `SYS_IPC_SEND_ERR_EAGAIN (1)`, with a fixed 4096-cycle spin
+backoff between attempts. Every other non-zero return (BAD_ID /
+PAYLOAD_LEN / EFAULT / CHANDEAD) hard-fails immediately. Exhausted
+retries set the sticky `audit_broker_failed` flag and return
+`AUDIT_ERR_SEND_FAILED`; the caller MUST exit 3 without emitting any
+user-visible output.
+
+==== PARENT-LINKAGE
+The parent-child linkage between a shell's `ShellCommandRecord` and its
+spawned child tools travels through the `parent_audit_id` slot at
+payload index [7]. The shell binds its command-record's audit_id via
+`audit_set_parent(shell_cmd_id)` in the child's process image before
+_start, and the child's every INVOKE/OUTPUT/EXIT send carries that id.
+A top-level audit (a login shell, or a tool spawned outside a shell)
+has parent = 0.
+
+`audit_set_parent` refuses non-IDLE state with `AUDIT_ERR_STATE` —
+identity mutations mid-flight would break replay assumptions.
+[[cref: shell#ShellCommandRecord]] documents the shell-side binding.
+
+==== HASH
+`AuditHash` exposes a streaming digest API — init/update/finalize. At
+M3-001 the primitive is FNV-1a-64 seeded with FNV_OFFSET_BASIS
+(0xcbf29ce484222325) and stepped by FNV_PRIME (0x100000001b3). The
+primitive swaps to BLAKE3-truncated (BLAKE3-256, upper 64 bits) when
+paideia-as v0.33+ exposes BLAKE3 as a stdlib intrinsic. The API
+surface, the `.bss` slot, and the return type are stable across the
+swap; only the empty-stream self-check constant changes (BLAKE3 has
+its own IV/state-init contract).
+
+==== POSIX-DIFFERENCES
+[[posix: no analog]] POSIX tools have no notion of a supervisor-visible
+audit journal that must land before any user-visible output. The
+closest ancestor is Linux `auditd` — but auditd is (a) kernel-driven
+via LSM hooks, not opt-in per tool, and (b) advisory: a tool that
+suppresses stdout without emitting an audit event is not detectable
+by an auditd consumer. libpdx-audit inverts both properties: userspace
+tools opt in by linking against the library, and the library refuses
+to let the tool emit output when the journal path is broken.
+
+[[posix: no analog]] The three-call API (`begin` / `record_output` /
+`commit`) has no POSIX equivalent. The closest shape is the SUS-3 POSIX
+audit primitives from `aud_*` (deprecated in 2004), which lacked
+parent linkage and had no retry discipline.
+
+==== EXAMPLES
+Consumer wire-up from `design/architecture.md` §1:
+
+    AuditRecord::reset()                       # bootstrap init
+    let id  = AuditClient::audit_begin(op_name, args)
+    AuditHash::audit_hash_init()
+    ... tool computes work and folds output bytes into the hash ...
+    let hh  = AuditHash::audit_hash_finalize()
+    let err = AuditClient::audit_record_output(id, schema, hh)
+    if err != 0 { sys_exit(3) }
+    ... tool emits output ...
+    let err = AuditClient::audit_commit(id, exit_code)
+    if err != 0 { sys_exit(3) }
+
+Shell parenting a child (paideia-os plan §5.2, shell.M3-003):
+
+    # in the shell's per-command block, before sys_execve:
+    AuditClient::audit_set_parent(shell_cmd_id)
+    sys_execve(child, argv, envp)
+
+==== CROSS-REFERENCES
+- [[cref: pkg#Audit-obligations]]    — pkg install/remove journaling.
+- [[cref: shell#ShellCommandRecord]] — parent-record shape.
+- [[cref: doc#DocReadRecord]]        — audit-first for reads.
+- [[cref: caps]]                     — cap manifest fields consumed by
+                                       libpdx-audit's caps.decl.
+- [[cref: libpdx-semantic-pipe]]     — audit records travel on a
+                                       semantic pipe once M3-001 lands.
+
+==== SEE-ALSO
+Upstream design: `design/tooling/r49-r50-plan.md` §3.4 and §5.13 in
+the paideia-os repo. Repo-internal shape: `design/architecture.md` in
+this repo. Wire-bytes fixture: `tests/goldens/trace_001.md`. Test
+protocol: `tests/README.md`.
+
+==== VERSION
+libpdx-audit 1.0.0 (R49 wave, M5-001 signed release).

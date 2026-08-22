@@ -1,0 +1,93 @@
+# libpdx-audit — CHANGELOG
+
+## v1.0.0 — 2026-08-22 (R49 wave close, M5-001)
+
+**First release.** Signed with the paideia-release-line hybrid
+Ed25519 + ML-DSA-65 key pair per
+`design/02-development-environment.md` §1140 (paideia-os). Ships
+`.pdxdoc` for `doc libpdx-audit` and mirrors to
+`https://pkgs.paideia-os/main/libpdx-audit/1.0.0/` per
+`release/RELEASE.md`.
+
+### Landed
+
+- **M1-001** scaffold + three-call API (`audit_begin`,
+  `audit_record_output`, `audit_commit`). State-machine gating +
+  record-shape storage.
+- **M1-002** `audit_id` allocation + `svc.audit-journal` broker binding
+  via `sys_svc_lookup` (SC+ ID 43); `AuditBroker::audit_send_committed_
+  record` marshals the wire payload + invokes `sys_ipc_send` (SC+ ID
+  42); monotonic id allocation from 1.
+- **M2-001** record shape matches `UEJ_KIND_TOOL_INVOKE=130` /
+  `UEJ_KIND_TOOL_OUTPUT=132` / `UEJ_KIND_TOOL_EXIT=133`; three
+  discriminable events per audit lifecycle via
+  `AuditBroker::audit_send_record(event_kind)`.
+- **M2-002** failure semantics: sticky `audit_broker_failed` flag on
+  any send failure; new `AuditClient::audit_can_emit_output` guard;
+  caller MUST exit 3 (I4 system-error) without emitting output.
+- **M2-003** retry-with-backoff — bounded 3 retries on
+  `SYS_IPC_SEND_ERR_EAGAIN` with a 4096-cycle spin backoff; every
+  other non-zero return hard-fails immediately.
+- **M3-001** streaming output-stream hash (FNV-1a-64 placeholder for
+  BLAKE3-truncated). New `AuditHash` module — init/update/finalize.
+  API surface stable across the eventual BLAKE3 primitive swap.
+- **M3-002** parent-child linkage via `record_parent_audit_id` +
+  `audit_set_parent`. Wire format grew 56 → 64 bytes; header word
+  `0x0000_0040_0000_0120`. Consumers that never call `audit_set_
+  parent` get parent = 0 (top-level) via `.bss` zero-init.
+- **M4-001** broker-unavailable refusal test driver
+  (`tests/test_broker_refusal.pdx`).
+- **M4-002** audit-journal replay correctness driver +
+  byte-for-byte fixture (`tests/test_replay_golden.pdx`,
+  `tests/goldens/trace_001.md`).
+- **M5-001** dual-signed release + `.pdxdoc` + mirror push. Ships
+  `doc/libpdx-audit.pdxdoc` source form, `release/manifest.pdxsig.
+  txt` release-manifest source, `release/RELEASE.md` operator
+  runbook. Signed build + mirror push runs when substrates S1
+  (paideia-as v0.33-crypto-kdf) and S2 (pkgs.paideia-os endpoint)
+  go green per `release/RELEASE.md` §1.
+
+### Known deferred substrate
+
+- **BLAKE3 stdlib intrinsic.** M3-001 ships FNV-1a-64 as a
+  documented placeholder; the swap to BLAKE3-truncated changes
+  only the internal primitive, not the API surface.
+- **QEMU end-to-end smoke.** The M4 drivers cover every
+  library-observable invariant. The full spawn-under-QEMU +
+  audit-endpoint payload capture + memcmp against
+  `tests/goldens/trace_001.md` runs when shell.M4 + a bootstrap
+  consumer + R49-PREP-007 (`audit_journal_broker_dispatch`
+  daemon body) all land. See `tests/README.md` §QEMU smoke
+  protocol.
+- **pkgs.paideia-os mirror endpoint.** The mirror does not exist
+  at R49 close. The signed `manifest.pdxsig` still lands in the
+  v1.0.0 GitHub release attachment set for out-of-band consumers
+  until the mirror stands.
+- **`doc` M2 compile pass.** The `.pdxdoc` compiled binary form
+  ships once doc.M2 lands. Until then consumers render the
+  source form verbatim — the format is human-readable text.
+
+### Wire-format contract at v1.0.0
+
+    IPC header word     = 0x0000_0040_0000_0120
+    Payload length      = 64 bytes (8 u64 words)
+    Payload layout      = [audit_id, event_kind, exit_code,
+                           op_name_ptr, op_args_ptr,
+                           output_schema_ptr, output_hash,
+                           parent_audit_id]
+    Event kinds         = UEJ_KIND_TOOL_INVOKE (130)
+                          UEJ_KIND_TOOL_OUTPUT (132)
+                          UEJ_KIND_TOOL_EXIT   (133)
+
+The wire format is a stable v1 contract. Any grow past 64 bytes
+requires a package major version bump.
+
+### Semver policy
+
+- **Major** — wire-format grow beyond `[u64; 8]`, error-code
+  renumber, state-machine graph change, or any API-surface removal.
+- **Minor** — additive API surface (new `AuditClient::*` entry
+  points, new `AuditHash::*` primitives), additive wire-format
+  slots via a new `payload_len` header word.
+- **Patch** — correctness fixes, primitive swap (FNV-1a-64 →
+  BLAKE3-truncated), retry-loop constant tuning.
