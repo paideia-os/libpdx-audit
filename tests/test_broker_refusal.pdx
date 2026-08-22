@@ -1,0 +1,183 @@
+// tests/test_broker_refusal.pdx — libpdx-audit.M4-001
+// Driver for the D3 audit-first "broker unavailable → tool refuses
+// output (exit 3)" invariant. Verifies the M2-002 sticky-flag guard
+// end to end at the API surface, using .bss fault-injection to
+// simulate the failure the kernel-side svc.audit-journal miss would
+// otherwise raise. See design/architecture.md §7 (send failure
+// discipline) and §13 (test discipline) for the invariant this
+// covers.
+//
+// Return convention (matches every M4 test driver in this repo):
+//
+//   0                       — all subtests passed.
+//   1..N (small u64)         — failing subtest ordinal (1 = first
+//                              subtest that failed; the ordinal is
+//                              stable across driver runs so a smoke
+//                              log can pinpoint which invariant broke).
+//
+// The driver is a pure leaf w.r.t. syscall: it never invokes
+// sys_ipc_send / sys_svc_lookup. This is deliberate — libpdx-audit
+// is a shared library with no runnable executable of its own, and
+// the M4-001 issue's real end-to-end check (spawn the driver as a
+// child of shell with no svc.audit-journal registered, verify the
+// child exits 3 and emits nothing) lives in the QEMU smoke matrix
+// once shell.M4 + a bootstrap consumer land. See tests/README.md
+// §M4-001 for the QEMU protocol; this file covers what can be
+// verified from the library's own type + memory surface.
+//
+// Effects `!{mem} @{}` — pure .bss read/write across reset() and
+// audit_can_emit_output(); no syscall, no cap consumption. Consumers
+// (the future pkg/shell test harness) link this and call
+// TestBrokerRefusal::run() from their own test-runner main.
+//
+// Cross-module functions called:
+//   AuditRecord::reset               (src/audit_record.pdx)
+//   AuditClient::audit_can_emit_output  (src/audit_client.pdx, M2-002)
+//   AuditClient::audit_set_parent    (src/audit_client.pdx, M3-002)
+// Cross-module .bss symbols read/written:
+//   audit_broker_failed              (src/audit_record.pdx, M2-002)
+//   audit_broker_slot                (src/audit_record.pdx)
+//   record_state                     (src/audit_record.pdx)
+//   record_parent_audit_id           (src/audit_record.pdx, M3-002)
+
+module TestBrokerRefusal = structure {
+
+  // ============================================================================
+  // run() -> u64
+  //
+  // Executes the M4-001 subtest sequence in order. Returns 0 on all-pass
+  // or the ordinal of the first failing subtest (1..7).
+  //
+  // Subtest ledger (each verifies one narrow invariant; ordering keeps
+  // the state-shape flowing forward so a subtest failure does not cross-
+  // contaminate a later subtest's expectations):
+  //
+  //   1  reset()          -> audit_broker_failed = 0 (fresh install: safe)
+  //   2  guard-safe path  -> audit_can_emit_output() == 1 after reset
+  //   3  fault-inject     -> write 1 into audit_broker_failed .bss slot
+  //   4  guard-refuse path-> audit_can_emit_output() == 0 with flag set
+  //   5  reset() clears   -> after reset, flag reads 0 again
+  //   6  guard-safe again -> audit_can_emit_output() == 1 after re-reset
+  //   7  broker slot reset-> audit_broker_slot = UNRESOLVED (0xFFFF) after reset
+  //
+  // Register plan (single leaf; no nested-call preservation needed since
+  // every callee is a pure leaf — reset, audit_can_emit_output —
+  // preserving no state across calls except .bss):
+  //   rax = call returns / .bss loads
+  //   r11 = LEA scratch (paideia-as reserved)
+  //   r12 = ordinal accumulator across the sequence (SysV callee-save;
+  //         pushed/popped as a pair with r13 to preserve rsp % 16 == 0
+  //         at every nested call).
+  //   r13 = unused; pushed for alignment parity only.
+  //
+  // Every immediate stays inside the paideia-as 0x7FFFFFFF cmp-imm bound;
+  // 0xFFFF (AUDIT_BROKER_SLOT_UNRESOLVED) is a 16-bit unsigned value
+  // that encodes as a sign-extended 32-bit immediate — legal.
+  // ============================================================================
+
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M4-001: TestBrokerRefusal::run entry point. Sequential subtest driver: seven .bss-only checks against the AuditRecord state and the AuditClient::audit_can_emit_output guard, verifying the M2-002 sticky-flag invariant that gates every consumer stdout/stderr write per D3 audit-first (design/architecture.md §7). Fault injection at subtest 3 writes 1 into audit_broker_failed via `mov rax,1; lea r11,[rip+audit_broker_failed]; mov [r11],rax` (parser.pdx cross-module-write pattern); subtest 4 verifies the guard reads that write and returns 0 (refuse). Subtest 5 verifies reset() clears the sticky flag per the M2-002 doc line 'once set, only reset() clears it'. Subtest 7 verifies reset() writes AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) into audit_broker_slot — the M1-002 sentinel that gates the fast-path in audit_broker_bind. Every call in this driver is a pure leaf (reset = !{mem} @{}, audit_can_emit_output = !{mem} @{}) so no register state needs preservation across calls beyond r12/r13 which are pushed for SysV callee-save discipline + rsp % 16 alignment parity — a future refactor that introduces a non-leaf could reuse the same pair. Label prefix tbr_ per project reserved-label discipline (labels using bare 'ok'/'fail' collide with paideia-as keywords; tbr_ prefix is unique). Return code: 0 on all-pass, 1..7 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (AUDIT_OK compare / .bss zero-check), 1 (safe-guard return / fault-inject value / ordinals), 2..7 (subtest ordinals), 0xFFFF (AUDIT_BROKER_SLOT_UNRESOLVED) — all within paideia-as cmp-imm bounds.",
+      block: {
+        push r12;
+        push r13;
+
+        // ---- Subtest 1: reset() zeroes the sticky flag. --------------
+        call reset;
+        lea r11, [rip + audit_broker_failed];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne tbr_fail_1;
+
+        // ---- Subtest 2: guard returns 1 (safe) after reset. ----------
+        call audit_can_emit_output;
+        cmp rax, 1;
+        jne tbr_fail_2;
+
+        // ---- Subtest 3: fault-inject a sticky failure via .bss write.
+        //      The invariant being tested is "any prior send failure
+        //      taints the whole invocation." Writing 1 here simulates
+        //      the M2-002 write from audit_send_record's asr_bind_fail
+        //      or asr_ipc_fail epilogue.
+        mov rax, 1;
+        lea r11, [rip + audit_broker_failed];
+        mov [r11], rax;
+
+        // ---- Subtest 4: guard returns 0 (refuse) with flag set. ------
+        //      This is the load-bearing D3 assertion — the consumer's
+        //      test harness (once wired) will exit 3 and emit no output
+        //      when this returns 0.
+        call audit_can_emit_output;
+        cmp rax, 0;
+        jne tbr_fail_4;
+
+        // ---- Subtest 5: reset() clears the sticky flag. --------------
+        call reset;
+        lea r11, [rip + audit_broker_failed];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne tbr_fail_5;
+
+        // ---- Subtest 6: guard returns 1 (safe) again after clear. ----
+        call audit_can_emit_output;
+        cmp rax, 1;
+        jne tbr_fail_6;
+
+        // ---- Subtest 7: reset() also primes audit_broker_slot to
+        //      AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). Verifying this
+        //      is part of the broker-refusal contract: a fresh reset()
+        //      must leave the bind-cache in the state that forces the
+        //      next audit_broker_bind to attempt a real svc_lookup
+        //      (which would fail broker-unavailable in the M4-001
+        //      QEMU environment, propagating AUDIT_ERR_BROKER_
+        //      UNAVAILABLE and setting the sticky flag again).
+        lea r11, [rip + audit_broker_slot];
+        mov rax, [r11];
+        cmp rax, 0xFFFF;
+        jne tbr_fail_7;
+
+        // All subtests passed.
+        xor rax, rax;                            // 0 = all pass
+        pop r13;
+        pop r12;
+        ret
+
+      tbr_fail_1:
+        mov rax, 1;
+        pop r13;
+        pop r12;
+        ret
+
+      tbr_fail_2:
+        mov rax, 2;
+        pop r13;
+        pop r12;
+        ret
+
+      tbr_fail_4:
+        mov rax, 4;
+        pop r13;
+        pop r12;
+        ret
+
+      tbr_fail_5:
+        mov rax, 5;
+        pop r13;
+        pop r12;
+        ret
+
+      tbr_fail_6:
+        mov rax, 6;
+        pop r13;
+        pop r12;
+        ret
+
+      tbr_fail_7:
+        mov rax, 7;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
