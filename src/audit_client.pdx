@@ -1,4 +1,4 @@
-// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002 + M2-001 + M2-002
+// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002 + M2-001 + M2-002 + M3-002
 // AuditClient: three-call user-facing API — audit_begin, audit_record_
 // output, audit_commit. State-machine gating per design/architecture.md
 // §4; wire format per §2. M1-002 stitched the send path in at commit;
@@ -21,7 +21,8 @@
 //   audit_id_next, record_audit_id, record_op_name_ptr,
 //   record_op_args_ptr, record_output_schema_ptr, record_output_hash,
 //   record_exit_code, record_state, audit_broker_failed (M2-002 read
-//   in audit_can_emit_output)
+//   in audit_can_emit_output), record_parent_audit_id (M3-002 write
+//   in audit_set_parent)
 // Cross-module functions called (M2-001):
 //   audit_send_record  (src/audit_broker.pdx)
 // Resolved by unqualified linker name — the same pattern
@@ -305,6 +306,69 @@ module AuditClient = structure {
 
       audit_cee_no:
         xor rax, rax;                            // refuse output (exit 3)
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_set_parent(parent_audit_id) -> u64
+  //   rdi = parent_audit_id       (0 iff top-level; else the parent's
+  //                                 audit_id — e.g. the shell's
+  //                                 ShellCommandRecord id propagated
+  //                                 to a child via the spawn hand-off)
+  //   rax = AUDIT_OK              on success
+  //       | AUDIT_ERR_STATE       if record_state != IDLE
+  //
+  // M3-002 entry point. Must be called AFTER AuditRecord::reset() and
+  // BEFORE AuditClient::audit_begin — parent_audit_id is a property
+  // of the audit's identity, not something a running audit can mutate.
+  // The IDLE gate enforces this: once audit_begin transitions to
+  // BEGUN, audit_set_parent is refused.
+  //
+  // The D3 audit-first contract requires every operation to be
+  // discoverable in the audit graph; parent_audit_id is the D3
+  // discipline handle for consumers — it lets a supervisor
+  // reconstruct the per-shell-command tree from a flat audit stream
+  // (shell writes its ShellCommandRecord with parent = 0, then
+  // propagates its own audit_id to the child; the child sets it
+  // here before its own audit_begin so all three of its lifecycle
+  // events — INVOKE / OUTPUT / EXIT — carry the linkage).
+  //
+  // Consumers that never call audit_set_parent get parent = 0 in
+  // their wire records via .bss zero-init (or reset()'s zero pass);
+  // this is the correct behaviour for the shell itself, a
+  // bootstrap tool spawned outside a shell, or any tool that has
+  // no parent audit context.
+  //
+  // How the parent_audit_id reaches the child is out of scope for
+  // libpdx-audit — the shell publishes its command-record id via
+  // its spawn protocol (env var, InitCap sidecar entry, or a
+  // typed-frame field on the child's stdin depending on which
+  // shell.M3 lands first). This library only exposes the setter.
+  //
+  // Pure leaf; no callee-save touched, no nested call.
+  // ============================================================================
+
+  pub let audit_set_parent : (u64) -> u64 !{mem} @{} =
+    fn (parent_audit_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M3-002: audit_set_parent entry point. Gate: record_state must be AUDIT_STATE_IDLE (0); on any other state return AUDIT_ERR_STATE (1) — parent linkage is a property of the audit's identity and cannot be mutated mid-flight. On IDLE, store rdi (parent_audit_id) into record_parent_audit_id via `lea r11,[rip+record_parent_audit_id]; mov [r11],rdi` per the parser.pdx cross-module-write pattern; return AUDIT_OK (0). Pure leaf — no push/pop, no nested call. Register plan: rax = state-load / return, r11 = LEA scratch, rdi = parent_audit_id argument (stored directly). Effects `!{mem} @{}` — pure .bss read/write, no syscall, no cap. Immediates: 0 (state gate + AUDIT_OK), 1 (AUDIT_ERR_STATE) — within paideia-as cmp-imm bounds. No test mnemonic; every zero-check is cmp reg, 0. Label prefix asp_ per project_paideiaos reserved-label discipline (labels using bare 'ok'/'fail' collide with keywords; asp_ok / asp_bad_state are unique).",
+      block: {
+        // ---- Gate: record_state must be IDLE (0) ---------------------
+        lea r11, [rip + record_state];
+        mov rax, [r11];
+        cmp rax, 0;                              // AUDIT_STATE_IDLE
+        jne asp_bad_state;
+
+        // ---- Store parent_audit_id from rdi. -------------------------
+        lea r11, [rip + record_parent_audit_id];
+        mov [r11], rdi;
+
+        xor rax, rax;                            // AUDIT_OK
+        ret
+
+      asp_bad_state:
+        mov rax, 1;                              // AUDIT_ERR_STATE
         ret
       }
     }

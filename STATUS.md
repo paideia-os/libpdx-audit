@@ -53,6 +53,25 @@
   audit_hash_update + audit_hash_finalize internals without changing
   the API surface, the record_hash_state .bss slot, or the return
   type. See design/architecture.md §11 for the streaming shape.
+- M3-002 — parent-child linkage with shell ShellCommandRecord via
+  audit_id: landed. New record_parent_audit_id .bss slot in
+  AuditRecord (zeroed by reset()); new AuditClient::audit_set_parent
+  (parent_audit_id) entry that stores the parent id iff record_state
+  == IDLE (else AUDIT_ERR_STATE — parent linkage is a property of
+  the audit's identity and cannot be mutated mid-flight). Wire
+  format grew 56 → 64 bytes: AUDIT_PAYLOAD_BYTES 56 → 64,
+  AUDIT_HDR_WORD 0x0000_0038_0000_0120 → 0x0000_0040_0000_0120
+  (only payload_len field changes; op / ver / reply_ep unchanged),
+  audit_payload_scratch [u64;7] → [u64;8]. AuditBroker::
+  audit_send_record marshals record_parent_audit_id at payload
+  index [7] on every INVOKE/OUTPUT/EXIT send and passes rcx=64 to
+  sys_ipc_send. The kernel-side broker dispatch is still stubbed
+  (AJB_DISPATCH_STUB), so the schema grow is safe until R49-PREP-007
+  lands the daemon body — at which point the kernel-side event
+  schema will need the parent_audit_id field added at index [7] to
+  keep byte-for-byte agreement. Consumers that never call
+  audit_set_parent get parent = 0 (top-level) via .bss zero-init —
+  the M2 shape is preserved. See design/architecture.md §12.
 
 ## Upstream design
 
@@ -63,7 +82,9 @@ wave-level rationale and the full milestone breakdown. See
 
 ## Next milestone
 
-M3 — Semantic-pipe / audit integration. BLAKE3-truncated output-stream
-hash computation (M3-001); parent-child linkage with shell's
-ShellCommandRecord via audit_id (M3-002). Depends on shell.M2 and
-libpdx-semantic-pipe.M2 per plan.md §5.13.
+M4 — Tests + smoke. Begin/record/commit round-trip (M4 open-ended);
+broker-unavailable refusal (M4-001: tool exits 3, no output); backoff
+correctness (3 retries); parent-child linkage against a shell trace;
+audit-journal replay against a known trace (M4-002). Depends on the
+R49-PREP-007 kernel-side ordinal split reaching a runnable daemon
+body so the replay can be verified end-to-end.

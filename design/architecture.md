@@ -61,10 +61,11 @@ for the M1 wire format (56 bytes of payload).
 | `record_op_name_ptr`        | `u64` |  8 B  | pointer to op-name string (NUL-terminated)       |
 | `record_op_args_ptr`        | `u64` |  8 B  | pointer to op-args string (NUL-terminated; may be 0) |
 | `record_output_schema_ptr`  | `u64` |  8 B  | pointer to output-schema name (0 iff not yet recorded) |
-| `record_output_hash`        | `u64` |  8 B  | BLAKE3-truncated output hash (M1 stub: caller-supplied u64) |
+| `record_output_hash`        | `u64` |  8 B  | BLAKE3-truncated output hash (M1 stub: caller-supplied u64; M3-001 streaming via AuditHash) |
 | `record_exit_code`          | `u64` |  8 B  | tool exit code (written by audit_commit)         |
 | `record_state`              | `u64` |  8 B  | one of AUDIT_STATE_*                             |
 | `audit_broker_slot`         | `u64` |  8 B  | cached cap slot for svc.audit-journal (M1-002)   |
+| `record_parent_audit_id`    | `u64` |  8 B  | parent audit id (M3-002; 0 iff top-level)        |
 
 Pointers into consumer memory are **live pointers into caller-owned
 memory**. libpdx-audit never mutates the strings — unlike libpdx-argv
@@ -72,27 +73,33 @@ which mutates argv in place on `--foo=bar`. The consumer must keep the
 argv-backing pages alive from `audit_begin` through `audit_commit`; the
 lifetimes match a single tool invocation, so this is the default.
 
-The wire format sent by `audit_commit` (M1-002) is a fixed 56-byte
-payload of seven u64 words in the order:
+The wire format sent by every lifecycle send is a fixed 64-byte
+payload of eight u64 words (grew from 56 → 64 at M3-002 to carry
+`parent_audit_id` at index [7]):
 
 ```
-u64 audit_id              // record_audit_id
-u64 event_kind            // stub: UEJ_KIND_TOOL_INVOKE (130) at M1;
-                          //   M2-001 splits into INVOKE/OUTPUT/EXIT
-u64 exit_code             // record_exit_code
-u64 op_name_ptr           // record_op_name_ptr
-u64 op_args_ptr           // record_op_args_ptr
-u64 output_schema_ptr     // record_output_schema_ptr
-u64 output_hash           // record_output_hash
+u64 audit_id              // record_audit_id                     [0]
+u64 event_kind            // UEJ_KIND_TOOL_INVOKE/OUTPUT/EXIT    [1]
+u64 exit_code             // record_exit_code                    [2]
+u64 op_name_ptr           // record_op_name_ptr                  [3]
+u64 op_args_ptr           // record_op_args_ptr                  [4]
+u64 output_schema_ptr     // record_output_schema_ptr            [5]
+u64 output_hash           // record_output_hash                  [6]
+u64 parent_audit_id       // record_parent_audit_id (M3-002)     [7]
 ```
 
 The IPC hdr uses the packed layout from `src/kernel/core/ipc/frame.pdx`
 in paideia-os: op = 0x20 (AUDIT_EVENT), ver = 1, reply_endpoint_id = 0
-(fire-and-forget), payload_len = 56. As a u64 constant this is
-`0x0000_0038_0000_0120`. M2-001 refines op / ver as the schema evolves
-to match `UEJ_KIND_TOOL_INSTALL/REMOVE/INVOKE/ERROR` (constants at
-`src/kernel/core/ipc/audit_journal_broker.pdx` in paideia-os,
-128..131).
+(fire-and-forget), payload_len = 64. As a u64 constant this is
+`0x0000_0040_0000_0120` (M3-002; was `0x0000_0038_0000_0120` at
+M2 when payload_len was 56). M2-001 refines op / ver as the schema
+evolves to match `UEJ_KIND_TOOL_INSTALL/REMOVE/INVOKE/ERROR`
+(constants at `src/kernel/core/ipc/audit_journal_broker.pdx` in
+paideia-os, 128..131). The kernel-side broker dispatch is still
+stubbed (`audit_journal_broker_dispatch` returns `AJB_DISPATCH_STUB`)
+so `sys_ipc_send` only enforces `payload_len ≤ PENDING_PAYLOAD_MAX_BYTES`,
+well above 64 — the schema grow is safe until the daemon body lands
+with a fixed schema at R49-PREP-007.
 
 ## 3. Storage model
 
@@ -358,6 +365,98 @@ nested call. Byte load uses `xor r10, r10; mov_b r10, [rdi + rcx]` per
 the paideia-as #1248 mitigation pattern (matches `acpi/checksum.pdx`
 and `acpi/hpet.pdx` in paideia-os kernel code — the `mov_b` primitive
 does not zero-extend on its own).
+
+## 12. M3-002 — parent-child linkage with shell `ShellCommandRecord`
+
+The M3-002 upgrade turns libpdx-audit's flat per-tool audit stream into
+a linkable tree: every audit record now carries a `parent_audit_id`
+slot that names its parent's `audit_id`. When a shell spawns a tool,
+the shell's own `ShellCommandRecord` is the parent (its `audit_id`
+comes from the shell's own `audit_begin`); the child sets that id
+here — via `AuditClient::audit_set_parent(parent_id)` — before its own
+`audit_begin`. All three of the child's lifecycle sends (INVOKE at
+`audit_begin`, OUTPUT at `audit_record_output`, EXIT at `audit_commit`)
+then carry the linkage in their wire payloads.
+
+This is the D3 audit-first discipline handle consumers need: a
+supervisor replaying the audit journal from a flat event stream can
+reconstruct the per-shell-command tree without any implicit shell-side
+ordering assumption.
+
+### 12.1 New client entry point
+
+```
+AuditClient::audit_set_parent(parent_audit_id) -> u64
+```
+
+- `rdi` = parent_audit_id (0 iff top-level).
+- Returns `AUDIT_OK` on success, `AUDIT_ERR_STATE` if
+  `record_state != IDLE`.
+- Must be called AFTER `AuditRecord::reset()` and BEFORE
+  `AuditClient::audit_begin`. The IDLE gate enforces this — parent
+  linkage is a property of the audit's identity and cannot be
+  mutated mid-flight.
+
+Consumers that never call `audit_set_parent` get `parent = 0` in
+their wire records via `.bss` zero-init (or `reset()`'s zero pass).
+`parent = 0` is the correct wire value for the shell itself, a
+bootstrap tool spawned outside a shell, or any tool with no parent
+audit context — the M2 shape (no linkage) remains the default.
+
+### 12.2 New `.bss` slot
+
+`record_parent_audit_id : u64` in `AuditRecord`. Zeroed by `reset()`.
+Marshalled by `AuditBroker::audit_send_record` at payload index [7]
+on every lifecycle send.
+
+### 12.3 Wire-format grow (56 → 64 bytes)
+
+The payload extends by one u64 word:
+
+| index | field                    |
+|------:|--------------------------|
+|   [0] | `record_audit_id`        |
+|   [1] | `event_kind`             |
+|   [2] | `record_exit_code`       |
+|   [3] | `record_op_name_ptr`     |
+|   [4] | `record_op_args_ptr`     |
+|   [5] | `record_output_schema_ptr` |
+|   [6] | `record_output_hash`     |
+|   [7] | `record_parent_audit_id` (M3-002) |
+
+Constants change:
+
+- `AUDIT_PAYLOAD_BYTES : u64 = 56` → `= 64`
+- `AUDIT_HDR_WORD : u64 = 0x0000_0038_0000_0120` →
+  `= 0x0000_0040_0000_0120` (only the payload_len field in the low
+  32 bits — `0x38` → `0x40` — changes; `op = 0x20`, `ver = 1`,
+  `reply_endpoint_id = 0` are unchanged)
+- `audit_payload_scratch : [u64; 7]` → `[u64; 8]`
+
+The kernel-side broker dispatch is still stubbed
+(`audit_journal_broker_dispatch` returns `AJB_DISPATCH_STUB`) so
+`sys_ipc_send` only enforces `payload_len ≤ PENDING_PAYLOAD_MAX_BYTES`,
+well above 64. The schema grow is therefore safe until the daemon
+body lands with a fixed schema at R49-PREP-007; when it does, the
+kernel-side event schema will need the `parent_audit_id` field added
+at the same index [7] to keep byte-for-byte agreement.
+
+### 12.4 How the parent_audit_id reaches the child
+
+Out of scope for libpdx-audit. The shell publishes its command-record
+id via its spawn protocol — env var, InitCap sidecar entry, or a
+typed-frame field on the child's stdin depending on which
+`shell.M3-003` (`ShellCommandRecord via libpdx-audit before sys_execve;
+close on wait` per r49-r50-plan.md §5.2) lands first. This library
+only exposes the setter; the transport is a shell concern.
+
+### 12.5 Register + effects discipline
+
+`audit_set_parent` is a pure leaf (`!{mem} @{}`) — one .bss read for
+the state gate, one .bss write for the parent slot. No syscall, no
+cap consumption, no push/pop. Label prefix `asp_` per the
+paideia-as reserved-label discipline (bare `ok` / `fail` collide
+with keywords; `asp_ok` / `asp_bad_state` are unique).
 
 ## 10. Cross-repo dependencies
 

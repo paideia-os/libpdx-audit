@@ -25,8 +25,16 @@ module AuditRecord = structure {
   pub let AUDIT_BROKER_SLOT_UNRESOLVED : u64 = 0xFFFF
 
   // --- Wire format sizes (see design/architecture.md §2). --------------
-  pub let AUDIT_PAYLOAD_BYTES : u64 = 56   // seven u64 words
-  pub let AUDIT_HDR_WORD      : u64 = 0x0000003800000120  // op=0x20 | ver=1 | reply_ep=0 | payload_len=56
+  // M3-002 upgrade: payload grows from 56 to 64 bytes (seven → eight
+  // u64 words) to carry record_parent_audit_id at payload index [7].
+  // AUDIT_HDR_WORD's payload_len field (top 16 bits of the low half,
+  // little-endian: bits [16..31] of the low 32) moves 0x38 → 0x40 to
+  // match. The kernel-side audit_journal_broker_dispatch stub
+  // (paideia-os src/kernel/core/ipc/audit_journal_broker.pdx) returns
+  // AJB_DISPATCH_STUB without validating the payload shape, so the
+  // grow is safe until the daemon body lands with a fixed schema.
+  pub let AUDIT_PAYLOAD_BYTES : u64 = 64   // eight u64 words (M3-002)
+  pub let AUDIT_HDR_WORD      : u64 = 0x0000004000000120  // op=0x20 | ver=1 | reply_ep=0 | payload_len=64
 
   // --- M3-001 FNV-1a-64 hash constants. Placeholder for the
   //     BLAKE3-truncated hash design/tooling/r49-r50-plan.md §5.13
@@ -82,6 +90,20 @@ module AuditRecord = structure {
   pub let mut record_state             : u64 = uninit @align(8)
   pub let mut audit_broker_slot        : u64 = uninit @align(8)
 
+  // M3-002 parent-child linkage slot. Written by
+  // AuditClient::audit_set_parent BEFORE audit_begin; 0 means
+  // top-level (no parent, e.g. the shell itself or a bootstrap tool
+  // spawned outside a shell context). AuditBroker::audit_send_record
+  // marshals this at payload index [7] on every INVOKE/OUTPUT/EXIT
+  // so a supervisor replaying the audit journal can reconstruct the
+  // per-shell-command tree: shell writes its own ShellCommandRecord
+  // (parent = 0), then propagates its audit_id to the child via the
+  // spawn hand-off, and the child sets it here before its own
+  // audit_begin. .bss zero-init means the M2 shape (no linkage)
+  // remains the default — consumers that never call audit_set_parent
+  // get parent = 0 in their wire records.
+  pub let mut record_parent_audit_id   : u64 = uninit @align(8)
+
   // M2-002 sticky failure flag. Written to 1 the first time any send
   // path (audit_begin's INVOKE, audit_record_output's OUTPUT, or
   // audit_commit's EXIT) fails; consumers read it via
@@ -107,11 +129,12 @@ module AuditRecord = structure {
   pub let mut record_hash_state        : u64 = uninit @align(8)
   pub let mut record_hash_active       : u64 = uninit @align(8)
 
-  // --- M1 send-time payload scratch. `.bss` again; 56 bytes = one
-  //     wire record. audit_commit memcpy-fills this before sys_ipc_send.
-  //     Sized in u64 words so paideia-as encodes it as an aligned array
-  //     rather than a byte blob. -----------------------------------------
-  pub let mut audit_payload_scratch : [u64; 7] = uninit @align(8)
+  // --- Send-time payload scratch. `.bss` again; 64 bytes = one wire
+  //     record at M3-002 (grew from 56 to 64 to carry parent_audit_id
+  //     at index [7]). audit_send_record memcpy-fills this before
+  //     sys_ipc_send. Sized in u64 words so paideia-as encodes it as
+  //     an aligned array rather than a byte blob. --------------------
+  pub let mut audit_payload_scratch : [u64; 8] = uninit @align(8)
   pub let mut audit_hdr_scratch     : u64      = uninit @align(8)
 
   // reset() — bootstrap init. Clears the in-progress record and
@@ -122,7 +145,7 @@ module AuditRecord = structure {
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001 + M3-002: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). M3-002 adds record_parent_audit_id to the zero pass so a consumer that never calls audit_set_parent gets parent = 0 (top-level) in its wire records, preserving the M2 shape. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
       block: {
         xor rax, rax;                                    // rax = 0
         lea r11, [rip + record_audit_id];          mov [r11], rax;
@@ -135,6 +158,7 @@ module AuditRecord = structure {
         lea r11, [rip + audit_broker_failed];      mov [r11], rax;
         lea r11, [rip + record_hash_state];        mov [r11], rax;
         lea r11, [rip + record_hash_active];       mov [r11], rax;
+        lea r11, [rip + record_parent_audit_id];   mov [r11], rax;
 
         mov rax, 1;                                      // audit_id_next = 1
         lea r11, [rip + audit_id_next];            mov [r11], rax;
