@@ -119,7 +119,7 @@ module AuditHash = structure {
   pub let audit_hash_update : (u64, u64) -> u64 !{mem} @{} =
     fn (ptr: u64) (len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M3-001: audit_hash_update entry point. Gate 1: record_hash_active must be 1 — on 0 return AUDIT_ERR_HASH_INACTIVE (5). Gate 2: len == 0 is a legal no-op returning AUDIT_OK. Body: load record_hash_state into r13; load FNV_PRIME (0x100000001b3, loaded via MOVABS — outside the cmp-imm 0x7FFFFFFF gate but fine for a register load) into r8; iterate rcx = 0..len: byte load via `xor r10,r10; mov_b r10,[rdi+rcx]` per the paideia-as #1248 mitigation pattern (acpi/checksum.pdx + acpi/hpet.pdx use the identical shape for u8 zero-extended reads — the mov_b primitive does not zero-extend on its own so the preceding xor is mandatory). Fold: `xor r13, r10` then `imul r13, r8` — the FNV-1a step. Advance rcx by 1, `cmp rcx, rsi; jb ahu_loop`. After the loop store r13 back to record_hash_state via lea+mov, return AUDIT_OK. Push/pop r13 + r8 as a pair to preserve rsp % 16 = 0 for both caller-save discipline and a future refactor that might introduce a nested call; both are callee-save under SysV so the pair is a nicety here (this function has no nested call) but the discipline mirrors audit_send_record. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (active-gate + len-zero + AUDIT_OK compare), 1 (active-flag positive value), 5 (AUDIT_ERR_HASH_INACTIVE) — all within the 0x7FFFFFFF cmp-imm bound. Effects `!{mem} @{}` — pure memory read/write, no syscall, no cap.",
+      justification: "libpdx-audit.M3-001: audit_hash_update entry point. Gate 1: record_hash_active must be 1 — on 0 return AUDIT_ERR_HASH_INACTIVE (5). Gate 2: len == 0 is a legal no-op returning AUDIT_OK. Body: load record_hash_state into r13; load FNV_PRIME (0x100000001b3, loaded via MOVABS — outside the cmp-imm 0x7FFFFFFF gate but fine for a register load) into r8; iterate rcx = 0..len: byte load via `xor r10,r10; mov_b r10,[rdi+rcx*1]` per the paideia-as #1248 mitigation pattern (acpi/checksum.pdx + acpi/hpet.pdx use the identical shape for u8 zero-extended reads — the mov_b primitive does not zero-extend on its own so the preceding xor is mandatory; the explicit `*1` scale on the index is required because paideia-as's SIB folding rejects a bare unscaled index register on the right of `+`). Fold: `xor r13, r10` then `imul r13, r8` — the FNV-1a step. Advance rcx by 1, `cmp rcx, rsi; jb ahu_loop`. After the loop store r13 back to record_hash_state via lea+mov, return AUDIT_OK. Push/pop r13 + r8 as a pair to preserve rsp % 16 = 0 for both caller-save discipline and a future refactor that might introduce a nested call; both are callee-save under SysV so the pair is a nicety here (this function has no nested call) but the discipline mirrors audit_send_record. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (active-gate + len-zero + AUDIT_OK compare), 1 (active-flag positive value), 5 (AUDIT_ERR_HASH_INACTIVE) — all within the 0x7FFFFFFF cmp-imm bound. Effects `!{mem} @{}` — pure memory read/write, no syscall, no cap.",
       block: {
         // ---- Prologue: preserve r13 (state accumulator) + r8 (FNV
         //      prime constant). Both are SysV callee-save; the pair
@@ -146,7 +146,14 @@ module AuditHash = structure {
 
       ahu_loop:
         xor r10, r10;                            // byte scratch = 0 (needed for mov_b zero-ext)
-        mov_b r10, [rdi + rcx];                  // r10 = *(u8*)(ptr + rcx)
+        mov_b r10, [rdi + rcx * 1];               // r10 = *(u8*)(ptr + rcx) — explicit
+                                                  // scale-1 SIB form: paideia-as's
+                                                  // base+index folding only recognizes
+                                                  // a scaled index (`reg * N`) on the
+                                                  // right of `+`; a bare unscaled index
+                                                  // register there hits an operand-parse
+                                                  // bug (U1606, mis-reported against the
+                                                  // base register's span).
 
         xor r13, r10;                            // state ^= byte
         imul r13, r8;                            // state *= FNV_PRIME
