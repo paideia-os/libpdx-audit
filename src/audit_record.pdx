@@ -12,6 +12,7 @@ module AuditRecord = structure {
   pub let AUDIT_ERR_ID_MISMATCH        : u64 = 2   // audit_id != record_audit_id
   pub let AUDIT_ERR_BROKER_UNAVAILABLE : u64 = 3   // svc_lookup miss / cap-table full
   pub let AUDIT_ERR_SEND_FAILED        : u64 = 4   // sys_ipc_send non-zero return
+  pub let AUDIT_ERR_HASH_INACTIVE      : u64 = 5   // audit_hash_update without prior audit_hash_init (M3-001)
 
   // --- State machine values written to record_state. --------------------
   pub let AUDIT_STATE_IDLE      : u64 = 0
@@ -26,6 +27,22 @@ module AuditRecord = structure {
   // --- Wire format sizes (see design/architecture.md §2). --------------
   pub let AUDIT_PAYLOAD_BYTES : u64 = 56   // seven u64 words
   pub let AUDIT_HDR_WORD      : u64 = 0x0000003800000120  // op=0x20 | ver=1 | reply_ep=0 | payload_len=56
+
+  // --- M3-001 FNV-1a-64 hash constants. Placeholder for the
+  //     BLAKE3-truncated hash design/tooling/r49-r50-plan.md §5.13
+  //     M3-001 specifies; the FNV-1a-64 primitive here swaps for
+  //     BLAKE3 (truncated to first 8 bytes) once paideia-as exposes
+  //     BLAKE3 as a stdlib intrinsic — the streaming API surface in
+  //     AuditHash (init/update/finalize) and the record_hash_state
+  //     .bss slot stay identical across that swap.
+  //
+  //     FNV_OFFSET_BASIS (0xcbf29ce484222325) exceeds the 0x7FFFFFFF
+  //     cmp-imm bound but is legal for a register load: paideia-as
+  //     encodes `mov r64, imm64` as MOVABS. Same for FNV_PRIME
+  //     (0x100000001b3 — 41-bit value, needs MOVABS). Both constants
+  //     are load-only; neither ever appears in a cmp instruction.
+  pub let FNV_OFFSET_BASIS : u64 = 0xcbf29ce484222325
+  pub let FNV_PRIME        : u64 = 0x100000001b3
 
   // --- M2-001 lifecycle event kinds. Written at payload index [1] by
   //     AuditBroker::audit_send_record so a supervisor replay can
@@ -74,6 +91,22 @@ module AuditRecord = structure {
   // (0 = healthy, 1 = failed).
   pub let mut audit_broker_failed      : u64 = uninit @align(8)
 
+  // M3-001 streaming-hash accumulator slots. Feed the tool's output
+  // stream into AuditHash::audit_hash_update as it is emitted;
+  // audit_hash_finalize reads record_hash_state and returns the
+  // truncated u64 the consumer passes to audit_record_output.
+  //
+  // record_hash_state — FNV-1a-64 accumulator (or the truncated
+  //   BLAKE3-256 first-8-bytes when the primitive swaps in). .bss
+  //   zero-init; audit_hash_init writes FNV_OFFSET_BASIS to seed.
+  // record_hash_active — 1 while an accumulation is in flight; 0
+  //   before init or after finalize. audit_hash_update refuses to
+  //   run when 0 (returns AUDIT_ERR_HASH_INACTIVE) so a caller
+  //   that forgets to init does not silently fold bytes into the
+  //   zero baseline.
+  pub let mut record_hash_state        : u64 = uninit @align(8)
+  pub let mut record_hash_active       : u64 = uninit @align(8)
+
   // --- M1 send-time payload scratch. `.bss` again; 56 bytes = one
   //     wire record. audit_commit memcpy-fills this before sys_ipc_send.
   //     Sized in u64 words so paideia-as encodes it as an aligned array
@@ -89,7 +122,7 @@ module AuditRecord = structure {
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M1-001 + M1-002 + M2-002: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
       block: {
         xor rax, rax;                                    // rax = 0
         lea r11, [rip + record_audit_id];          mov [r11], rax;
@@ -100,6 +133,8 @@ module AuditRecord = structure {
         lea r11, [rip + record_exit_code];         mov [r11], rax;
         lea r11, [rip + record_state];             mov [r11], rax;
         lea r11, [rip + audit_broker_failed];      mov [r11], rax;
+        lea r11, [rip + record_hash_state];        mov [r11], rax;
+        lea r11, [rip + record_hash_active];       mov [r11], rax;
 
         mov rax, 1;                                      // audit_id_next = 1
         lea r11, [rip + audit_id_next];            mov [r11], rax;

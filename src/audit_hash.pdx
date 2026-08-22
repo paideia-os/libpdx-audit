@@ -1,0 +1,225 @@
+// src/audit_hash.pdx — libpdx-audit.M3-001
+// AuditHash: streaming output-stream hash accumulator.
+//
+// Three entry points, matching the streaming-digest shape:
+//
+//   audit_hash_init()                    -> ()
+//   audit_hash_update(ptr, len)          -> u64  (AUDIT_OK | AUDIT_ERR_HASH_INACTIVE)
+//   audit_hash_finalize()                -> u64  (accumulated hash truncated to u64)
+//
+// Consumer wire-up:
+//
+//   AuditHash::audit_hash_init()
+//   … tool emits chunk1 … AuditHash::audit_hash_update(chunk1_ptr, chunk1_len)
+//   … tool emits chunk2 … AuditHash::audit_hash_update(chunk2_ptr, chunk2_len)
+//   let h = AuditHash::audit_hash_finalize()
+//   AuditClient::audit_record_output(id, schema, h)
+//
+// D3 audit-first invariant (design/tooling/r49-r50-plan.md §1 in
+// paideia-os): a supervisor replaying the audit journal can verify
+// WHAT the tool emitted even if the output stream itself was
+// ephemeral — the hash makes byte-for-byte forgery detectable.
+//
+// M3-001 hash primitive: FNV-1a-64 as a placeholder for the
+// BLAKE3-truncated hash the plan specifies. BLAKE3 is not yet
+// exposed as a paideia-as intrinsic — the v0.33-crypto-kdf bundle
+// (design/user/model.md §11.2) ships Argon2id + ChaCha20-Poly1305
+// + ML-DSA-65 but not BLAKE3. When BLAKE3 lands as a paideia-as
+// stdlib intrinsic (post-v0.33), the internals of audit_hash_update
+// (byte-wise xor-multiply) and audit_hash_finalize (state load)
+// swap for calls to the intrinsic — the API surface, the state
+// storage in AuditRecord's .bss, and the return type all stay the
+// same. This mirrors the M2-001 stubbing of UEJ_KIND_TOOL_OUTPUT /
+// EXIT ordinals pending kernel-side R49-PREP-007.
+//
+// FNV-1a-64 is deterministic, dependency-free, and (unlike a truly
+// cryptographic hash) verifiable by hand from a short byte sequence
+// — good enough for M3-001's supervisor-replay checkpoint while
+// BLAKE3 is out of scope. The truncation-to-u64 semantics remain
+// identical between placeholder and final: BLAKE3-256 output would
+// be truncated to its first 8 bytes; FNV-1a-64 already IS 8 bytes.
+//
+// See design/architecture.md §11 for the state-machine + storage
+// model. Upstream: design/tooling/r49-r50-plan.md §3.4 + §5.13
+// (paideia-os).
+//
+// Cross-module symbols read/written (all in AuditRecord .bss):
+//   record_hash_state, record_hash_active
+// Cross-module constants referenced:
+//   AuditRecord::FNV_OFFSET_BASIS, AuditRecord::FNV_PRIME
+//   AuditRecord::AUDIT_OK, AuditRecord::AUDIT_ERR_HASH_INACTIVE
+
+module AuditHash = structure {
+
+  // ============================================================================
+  // audit_hash_init() -> ()
+  //
+  // Seeds record_hash_state with FNV_OFFSET_BASIS (0xcbf29ce484222325)
+  // and sets record_hash_active = 1. Idempotent — a re-init on an
+  // already-active accumulator resets it to the empty-stream state,
+  // which matches BLAKE3's `Hasher::new()` semantics too.
+  //
+  // Pure leaf; no callee-save touched. Called at the top of the
+  // tool's output loop, typically right after audit_begin.
+  // ============================================================================
+
+  pub let audit_hash_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M3-001: audit_hash_init entry point. Two .bss writes via `lea r11,[rip+sym]; mov [r11],reg` (parser.pdx cross-module-write pattern): (1) record_hash_state = FNV_OFFSET_BASIS (0xcbf29ce484222325, loaded via mov r64,imm64 which paideia-as encodes as MOVABS — outside the 0x7FFFFFFF cmp-imm gate but fine for a register load); (2) record_hash_active = 1. No syscall, no cap consumption — `!{mem} @{}` matches AuditRecord::reset()'s effect tail. Leaf: no push/pop, no nested call. Register plan: rax = FNV_OFFSET_BASIS then 1, r11 = LEA scratch.",
+      block: {
+        mov rax, 0xcbf29ce484222325;             // FNV_OFFSET_BASIS
+        lea r11, [rip + record_hash_state];
+        mov [r11], rax;
+
+        mov rax, 1;                              // active = 1
+        lea r11, [rip + record_hash_active];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_hash_update(ptr, len) -> u64
+  //   rdi = ptr    (bytes to fold into the hash)
+  //   rsi = len    (byte count; 0 is a legal no-op)
+  //   rax = AUDIT_OK                 on success (or on len == 0 no-op)
+  //       | AUDIT_ERR_HASH_INACTIVE  if audit_hash_init was not called
+  //
+  // Folds `len` bytes at `ptr` into record_hash_state using the
+  // FNV-1a step: state = (state ^ byte) * FNV_PRIME (0x100000001b3).
+  // Bytes are loaded via the `xor rax,rax; mov_b rax,[ptr]` pattern
+  // per the paideia-as #1248 mitigation (see acpi/checksum.pdx and
+  // acpi/hpet.pdx for identical byte-load usage in kernel code).
+  //
+  // Refuses to run if record_hash_active == 0 — audit_hash_init must
+  // be called first. This is defence-in-depth: a caller that
+  // forgets to init would otherwise accumulate into whatever the
+  // .bss zero-init left behind (state=0, which produces a valid but
+  // meaningless hash).
+  //
+  // Register plan (single loop, no nested call — no callee-save
+  // touched, but the loop touches r10 and r8 which are caller-save):
+  //   r11 = LEA scratch
+  //   rcx = byte index (0 .. len)
+  //   r13 = current hash state (in-loop accumulator; loaded from
+  //         .bss before the loop, stored back after; using r13
+  //         keeps rax free for the byte load and the return code)
+  //   r10 = per-iteration byte value (zero-extended)
+  //   r8  = FNV_PRIME constant (loaded once before the loop)
+  //   rax = state load / return code
+  //
+  // r13 is callee-save under SysV — since audit_hash_update has NO
+  // nested call inside the loop, the push/pop of r13 is a nicety
+  // for a hypothetical future refactor rather than a strict
+  // correctness requirement. Keep it paired for rsp % 16 alignment
+  // discipline anyway (matches audit_send_record's push/pop shape).
+  // ============================================================================
+
+  pub let audit_hash_update : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M3-001: audit_hash_update entry point. Gate 1: record_hash_active must be 1 — on 0 return AUDIT_ERR_HASH_INACTIVE (5). Gate 2: len == 0 is a legal no-op returning AUDIT_OK. Body: load record_hash_state into r13; load FNV_PRIME (0x100000001b3, loaded via MOVABS — outside the cmp-imm 0x7FFFFFFF gate but fine for a register load) into r8; iterate rcx = 0..len: byte load via `xor r10,r10; mov_b r10,[rdi+rcx]` per the paideia-as #1248 mitigation pattern (acpi/checksum.pdx + acpi/hpet.pdx use the identical shape for u8 zero-extended reads — the mov_b primitive does not zero-extend on its own so the preceding xor is mandatory). Fold: `xor r13, r10` then `imul r13, r8` — the FNV-1a step. Advance rcx by 1, `cmp rcx, rsi; jb ahu_loop`. After the loop store r13 back to record_hash_state via lea+mov, return AUDIT_OK. Push/pop r13 + r8 as a pair to preserve rsp % 16 = 0 for both caller-save discipline and a future refactor that might introduce a nested call; both are callee-save under SysV so the pair is a nicety here (this function has no nested call) but the discipline mirrors audit_send_record. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (active-gate + len-zero + AUDIT_OK compare), 1 (active-flag positive value), 5 (AUDIT_ERR_HASH_INACTIVE) — all within the 0x7FFFFFFF cmp-imm bound. Effects `!{mem} @{}` — pure memory read/write, no syscall, no cap.",
+      block: {
+        // ---- Prologue: preserve r13 (state accumulator) + r8 (FNV
+        //      prime constant). Both are SysV callee-save; the pair
+        //      keeps rsp % 16 == 0 for any future nested call.
+        push r13;
+        push r8;
+
+        // ---- Gate 1: hash must be active. -----------------------------
+        lea r11, [rip + record_hash_active];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  ahu_inactive;
+
+        // ---- Gate 2: len == 0 is a legal no-op. -----------------------
+        cmp rsi, 0;
+        je  ahu_done_ok;
+
+        // ---- Body: load state + prime into loop registers. ------------
+        lea r11, [rip + record_hash_state];
+        mov r13, [r11];                          // state
+        mov r8,  0x100000001b3;                  // FNV_PRIME
+
+        xor rcx, rcx;                            // byte index = 0
+
+      ahu_loop:
+        xor r10, r10;                            // byte scratch = 0 (needed for mov_b zero-ext)
+        mov_b r10, [rdi + rcx];                  // r10 = *(u8*)(ptr + rcx)
+
+        xor r13, r10;                            // state ^= byte
+        imul r13, r8;                            // state *= FNV_PRIME
+
+        add rcx, 1;                              // rcx += 1
+        cmp rcx, rsi;                            // rcx < len ?
+        jb  ahu_loop;
+
+        // ---- Epilogue: store state back to .bss. ----------------------
+        lea r11, [rip + record_hash_state];
+        mov [r11], r13;
+
+      ahu_done_ok:
+        xor rax, rax;                            // AUDIT_OK
+        pop r8;
+        pop r13;
+        ret
+
+      ahu_inactive:
+        mov rax, 5;                              // AUDIT_ERR_HASH_INACTIVE
+        pop r8;
+        pop r13;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_hash_finalize() -> u64
+  //   rax = accumulated hash (u64) if active == 1
+  //       | 0                        if active == 0 (never initialised
+  //                                    or already finalised)
+  //
+  // Reads record_hash_state, clears record_hash_active to 0, returns
+  // the state. Clearing active on finalize enforces the single-use
+  // discipline — a caller that wants a fresh stream must call
+  // audit_hash_init again. This matches BLAKE3's `Hasher::finalize`
+  // consuming-self shape.
+  //
+  // Returns 0 when inactive rather than an error code — the caller's
+  // audit_record_output already accepts a u64 hash and cannot
+  // discriminate a "zero hash by chance" from a "zero hash by
+  // finalize-on-inactive"; treating both as 0 keeps the surface
+  // simple and lets the caller check active-state via audit_hash_init
+  // discipline instead. Consumers who need distinct error signalling
+  // for finalize-on-inactive should sequence init/update/finalize in
+  // a single scope and rely on the update-side AUDIT_ERR_HASH_INACTIVE.
+  //
+  // Pure leaf; no callee-save touched.
+  // ============================================================================
+
+  pub let audit_hash_finalize : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.M3-001: audit_hash_finalize entry point. Fast path if inactive: return 0 without touching record_hash_state (leaves the state visible for post-mortem inspection). Active path: load record_hash_state into rax (the return register), clear record_hash_active to 0 via a separate rcx write (rcx holds the zero because rax now carries the return value we must not clobber), return. Pure leaf — no push/pop, no nested call. Register plan: rax = active-load then state-load (return), rcx = zero-write scratch for active clear, r11 = LEA scratch. Immediates: 0 (active gate + zero-write + inactive return) — within the cmp-imm 0x7FFFFFFF bound. Effects `!{mem} @{}` — pure memory read/write, no syscall.",
+      block: {
+        // ---- Fast path: inactive returns 0. --------------------------
+        lea r11, [rip + record_hash_active];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  ahf_inactive;
+
+        // ---- Active: load state, clear active flag, return state. ----
+        lea r11, [rip + record_hash_state];
+        mov rax, [r11];                          // rax = state (return)
+
+        xor rcx, rcx;                            // active = 0 (via rcx to preserve rax)
+        lea r11, [rip + record_hash_active];
+        mov [r11], rcx;
+        ret
+
+      ahf_inactive:
+        xor rax, rax;                            // 0
+        ret
+      }
+    }
+}

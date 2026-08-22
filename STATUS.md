@@ -1,7 +1,7 @@
 # libpdx-audit — status
 
 **Wave:** R49 shared library
-**Current milestone:** M2 (core implementation) — landed
+**Current milestone:** M3 (semantic-pipe / audit integration) — in progress
 
 ## Milestone progress
 
@@ -35,6 +35,24 @@
   retry; every other non-zero return (BAD_ID / PAYLOAD_LEN / EFAULT
   / CHANDEAD) hard-fails immediately. Exhausted retries fall through
   to the M2-002 sticky-flag + AUDIT_ERR_SEND_FAILED epilogue.
+- M3-001 — audit_record_output writes BLAKE3-truncated output-stream
+  hash: landed. New AuditHash module (src/audit_hash.pdx) exposes a
+  streaming digest API: audit_hash_init() seeds record_hash_state
+  with FNV_OFFSET_BASIS (0xcbf29ce484222325) and sets
+  record_hash_active = 1; audit_hash_update(ptr, len) folds bytes
+  into state via the FNV-1a step (state = (state ^ byte) * FNV_PRIME
+  0x100000001b3) with the paideia-as #1248 xor+mov_b zero-extended
+  byte-load pattern; audit_hash_finalize() returns the accumulated
+  state and clears active. audit_record_output's signature is
+  UNCHANGED — consumers who use the streaming API pass
+  audit_hash_finalize's return as the output_hash argument. New
+  AUDIT_ERR_HASH_INACTIVE (5) returned by audit_hash_update when
+  called without a prior audit_hash_init. FNV-1a-64 is a documented
+  placeholder for the BLAKE3-truncated hash the plan specifies —
+  BLAKE3 is not yet in paideia-as v0.33-crypto-kdf; the swap replaces
+  audit_hash_update + audit_hash_finalize internals without changing
+  the API surface, the record_hash_state .bss slot, or the return
+  type. See design/architecture.md §11 for the streaming shape.
 
 ## Upstream design
 

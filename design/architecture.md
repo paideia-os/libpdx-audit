@@ -252,13 +252,112 @@ Called out here so a reader of M1 code does not mistake absence for bug:
 - No BLAKE3-truncated hash computation. M1 accepts a caller-supplied
   u64 in `audit_record_output`'s `output_hash` slot; the hash
   computation from the tool's actual output stream lands with
-  `libpdx-audit.M3-001`.
+  `libpdx-audit.M3-001` (see §11 below).
 - No parent-child linkage with shell's `ShellCommandRecord`. M1 hands
   out a bare audit_id per record; `libpdx-audit.M3-002` adds the
   `parent_audit_id` field alongside a shell-side hook.
 - No output emission of the record shape. M1 sends the record over
   IPC; the semantic-pipe binding via libpdx-semantic-pipe lands with
   the M3 line.
+
+## 11. M3-001 — streaming output-stream hash
+
+The M3-001 upgrade to `audit_record_output`'s `output_hash` slot: the
+library now provides a streaming digest a consumer folds its output
+stream into as bytes are emitted. `AuditHash` (`src/audit_hash.pdx`)
+exposes three entry points and one hidden `.bss` accumulator:
+
+```
+AuditHash::audit_hash_init()                       -> ()
+AuditHash::audit_hash_update(ptr, len)             -> u64
+AuditHash::audit_hash_finalize()                   -> u64
+```
+
+Consumer wire-up:
+
+```
+AuditHash::audit_hash_init()
+… tool emits chunk N … AuditHash::audit_hash_update(chunk_ptr, chunk_len)
+let h = AuditHash::audit_hash_finalize()
+AuditClient::audit_record_output(id, schema, h)
+```
+
+`audit_record_output`'s signature is UNCHANGED — it still takes a
+caller-supplied `u64` hash. M3-001 is additive: consumers that want the
+audit-first hash-of-output-stream discipline (D3) call the streaming
+API and pass its finalize result; consumers that have their own hash
+source pass that directly, as they did at M2.
+
+### 11.1 Hash primitive: FNV-1a-64 placeholder for BLAKE3-truncated
+
+The plan (`design/tooling/r49-r50-plan.md` §5.13 M3-001 line) specifies
+BLAKE3-truncated. paideia-as v0.33-crypto-kdf (per `design/user/model.md`
+§11.2 in paideia-os) ships Argon2id + ChaCha20-Poly1305 + ML-DSA-65 —
+BLAKE3 is not yet exposed as a stdlib intrinsic. Rather than block M3-001
+on a paideia-as toolchain wave, this milestone ships FNV-1a-64 as the
+underlying primitive and documents it as a swap-target:
+
+- The streaming API (`init` / `update` / `finalize`) is BLAKE3-shaped.
+- `record_hash_state` is a u64 slot; BLAKE3-256 truncated to first
+  8 bytes fits identically. FNV-1a-64 already IS 64 bits — no
+  truncation needed.
+- When BLAKE3 arrives as a paideia-as intrinsic (post-v0.33), the
+  internals of `audit_hash_update` (byte-wise xor-multiply) and
+  `audit_hash_finalize` swap for calls to the intrinsic. Consumer
+  code, the `.bss` slot, the wire format, and the return type all
+  stay the same.
+
+This mirrors the M2-001 stubbing pattern (UEJ_KIND_TOOL_OUTPUT and
+UEJ_KIND_TOOL_EXIT forward-declared at ordinals 132/133 pending the
+R49-PREP-007 kernel-side ordinal split).
+
+FNV-1a-64 constants live in `AuditRecord`:
+
+- `FNV_OFFSET_BASIS = 0xcbf29ce484222325` — seed state on init.
+- `FNV_PRIME = 0x100000001b3` — multiplied into state after each
+  XOR-fold.
+
+Both exceed the 0x7FFFFFFF cmp-imm bound but are legal for a register
+load: paideia-as encodes `mov r64, imm64` as MOVABS. Neither constant
+ever appears in a cmp instruction.
+
+### 11.2 State + storage
+
+Two new slots in `AuditRecord`'s `.bss`:
+
+| slot                 | type  | width | meaning                                          |
+|----------------------|-------|-------|--------------------------------------------------|
+| `record_hash_state`  | `u64` |  8 B  | FNV-1a-64 accumulator (BLAKE3-truncated later)   |
+| `record_hash_active` | `u64` |  8 B  | 1 while accumulating; 0 before init / after final|
+
+`reset()` zeros both — a fresh reset() at process start gives
+`audit_hash_init` a clean starting point (rather than inheriting a
+hash-in-flight from a prior audit within the same process). `audit_hash_init` seeds `record_hash_state` with `FNV_OFFSET_BASIS` and
+writes `record_hash_active = 1`; `audit_hash_finalize` reads the state,
+clears active to 0, returns the state.
+
+### 11.3 New error code
+
+- `AUDIT_ERR_HASH_INACTIVE = 5` — returned by `audit_hash_update` when
+  `record_hash_active == 0`. Defence-in-depth: a caller that forgets
+  to init would otherwise fold bytes into whatever the `.bss`
+  zero-init left behind (state = 0, producing a valid-looking but
+  meaningless hash). `audit_hash_finalize` returns 0 on inactive
+  instead of an error code — the u64 return channel cannot
+  discriminate zero-by-chance from zero-by-inactive, so the
+  discipline is enforced at update-time.
+
+### 11.4 Register + effects discipline
+
+`AuditHash` functions are all `!{mem} @{}` — pure memory read/write, no
+syscall, no cap consumption. `audit_hash_update` uses `r13` (state
+accumulator loaded/stored across the loop) and `r8` (FNV_PRIME constant
+loaded once); both are SysV callee-save and pushed/popped as a pair to
+preserve `rsp % 16 == 0` for any future refactor that introduces a
+nested call. Byte load uses `xor r10, r10; mov_b r10, [rdi + rcx]` per
+the paideia-as #1248 mitigation pattern (matches `acpi/checksum.pdx`
+and `acpi/hpet.pdx` in paideia-os kernel code — the `mov_b` primitive
+does not zero-extend on its own).
 
 ## 10. Cross-repo dependencies
 
