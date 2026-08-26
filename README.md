@@ -38,7 +38,8 @@ capability set, both as declared on the `pub let`.
 
 | Signature | Purpose |
 |---|---|
-| `audit_begin(op_name, op_args) -> u64 !{mem, sysreg} @{cap, sched}` | Open an audit. Requires `record_state == IDLE`; allocates a monotonic `audit_id`, stores the two NUL-terminated string pointers, transitions IDLE → BEGUN, and emits `UEJ_KIND_TOOL_INVOKE`. Returns the id (> 0) or **0** on state-gate failure *or* send failure. |
+| `audit_begin(op_name, op_args) -> u64 !{mem, sysreg} @{cap, sched}` | Open an audit. Requires `record_state == IDLE`; allocates a monotonic `audit_id`, stores the two NUL-terminated string pointers, transitions IDLE → BEGUN, and emits `UEJ_KIND_TOOL_INVOKE`. Returns the id (> 0) or **0** on state-gate failure *or* send failure — **this is a bare 0 sentinel, not negative-errno**; do not `cmp rax, 0; jl` against it (always false). Call `audit_last_error()` after a 0 return to tell the two failure causes apart. |
+| `audit_last_error() -> u64 !{mem} @{}` | Post-1.0.0 (ENH-006). The real cause of the most recent `audit_begin`: `AUDIT_OK` on success or before any call, `AUDIT_ERR_STATE` on the IDLE-gate branch, or the verbatim `AUDIT_ERR_BROKER_UNAVAILABLE` / `AUDIT_ERR_SEND_FAILED` from a failed INVOKE send. |
 | `audit_record_output(audit_id, output_schema, output_hash) -> u64 !{mem, sysreg} @{cap, sched}` | Declare the schema-typed output about to be emitted. Gates on state == BEGUN then on id match, transitions BEGUN → OUTPUT, emits `UEJ_KIND_TOOL_OUTPUT`. Optional: a tool with no schema-typed output may go straight to commit. |
 | `audit_commit(audit_id, exit_code) -> u64 !{mem, sysreg} @{cap, sched}` | Close the audit. Legal from BEGUN or OUTPUT; stores `exit_code`, transitions to COMMITTED, emits `UEJ_KIND_TOOL_EXIT`, and on success resets state to IDLE so a later `audit_begin` starts fresh. On failure state stays COMMITTED for post-mortem. |
 | `audit_can_emit_output() -> u64 !{mem} @{}` | The D3 output gate: returns `1` only when the sticky `audit_broker_failed` flag is clear **and** an audit is actually open (`record_state` is `BEGUN` or `OUTPUT`); returns `0` — caller must `exit 3` emitting nothing — otherwise, including when no audit was ever begun or one already committed (post-1.0.0 fail-closed fix, ENH-005). |
@@ -93,8 +94,9 @@ zeroing): `audit_id_next`, `record_audit_id`, `record_op_name_ptr`,
 `record_op_args_ptr`, `record_output_schema_ptr`, `record_output_hash`,
 `record_exit_code`, `record_state`, `audit_broker_slot`,
 `record_parent_audit_id`, `audit_broker_failed`, `record_hash_state`,
-`record_hash_active`, plus the send scratch
-`audit_payload_scratch : [u64; 8]` and `audit_hdr_scratch : u64`.
+`record_hash_active`, `audit_last_error` (ENH-006), plus the send
+scratch `audit_payload_scratch : [u64; 8]` and
+`audit_hdr_scratch : u64`.
 
 ### `src/syscall_shim.pdx` — `SyscallShim`
 

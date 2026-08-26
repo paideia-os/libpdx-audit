@@ -113,6 +113,21 @@ module AuditRecord = structure {
   // (0 = healthy, 1 = failed).
   pub let mut audit_broker_failed      : u64 = uninit @align(8)
 
+  // ENH-006 (post-1.0.0) failure-cause slot. `audit_begin` returns a
+  // bare `0` on EITHER a state-gate violation OR a send failure — a
+  // conflation every other IPC-adjacent shim in this org avoids by
+  // returning negative-errno. Rather than change `audit_begin`'s
+  // return convention (a wire-stable, widely-copied shape), this slot
+  // records the real cause so a caller can disambiguate after the
+  // fact via `AuditClient::audit_last_error()`: written to
+  // AUDIT_ERR_STATE on the state-gate branch, to the verbatim
+  // AUDIT_ERR_BROKER_UNAVAILABLE / AUDIT_ERR_SEND_FAILED code on a
+  // send failure, and to AUDIT_OK (0) on success. .bss zero-init
+  // means "no audit_begin call yet" also reads AUDIT_OK, same as a
+  // never-failed one — callers gate on `audit_begin`'s own return
+  // value first and consult this slot only after that returns 0.
+  pub let mut audit_last_error         : u64 = uninit @align(8)
+
   // M3-001 streaming-hash accumulator slots. Feed the tool's output
   // stream into AuditHash::audit_hash_update as it is emitted;
   // audit_hash_finalize reads record_hash_state and returns the
@@ -145,7 +160,7 @@ module AuditRecord = structure {
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001 + M3-002: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). M3-002 adds record_parent_audit_id to the zero pass so a consumer that never calls audit_set_parent gets parent = 0 (top-level) in its wire records, preserving the M2 shape. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001 + M3-002 + ENH-006: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). M3-002 adds record_parent_audit_id to the zero pass so a consumer that never calls audit_set_parent gets parent = 0 (top-level) in its wire records, preserving the M2 shape. ENH-006 adds audit_last_error to the zero pass so a fresh process reads AUDIT_OK (0) from audit_last_error before any audit_begin call, matching the 'no failure yet' meaning. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
       block: {
         xor rax, rax;                                    // rax = 0
         lea r11, [rip + record_audit_id];          mov [r11], rax;
@@ -159,6 +174,7 @@ module AuditRecord = structure {
         lea r11, [rip + record_hash_state];        mov [r11], rax;
         lea r11, [rip + record_hash_active];       mov [r11], rax;
         lea r11, [rip + record_parent_audit_id];   mov [r11], rax;
+        lea r11, [rip + audit_last_error];         mov [r11], rax;
 
         mov rax, 1;                                      // audit_id_next = 1
         lea r11, [rip + audit_id_next];            mov [r11], rax;

@@ -22,6 +22,7 @@ libpdx-audit — audit-first output for paideia-os tools.
       pub let audit_commit       : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
       pub let audit_set_parent   : (u64) -> u64 !{mem} @{}
       pub let audit_can_emit_output : () -> u64 !{} @{}
+      pub let audit_last_error   : () -> u64 !{mem} @{}
     }
     module AuditHash = structure {
       pub let audit_hash_init     : () -> u64 !{mem} @{}
@@ -65,6 +66,24 @@ allocated `audit_id` (u64 > 0) on success, or 0 on failure (state gate
 or send failure — see [[cref: ERROR-CODES]]). On success transitions
 `record_state` IDLE → BEGUN and issues an INVOKE event to the broker.
 
+CAUTION: the failure sentinel is a bare `0`, NOT negative-errno. Every
+other IPC-adjacent shim in this org signals failure with a negative
+u64 tested via `cmp rax, 0; jl fail`; `audit_begin` does not follow
+that idiom, and `cmp rax, 0; jl` against its return is always false —
+a consumer that copies the negative-errno pattern here silently treats
+every `audit_begin` failure as success. Test `cmp rax, 0; je fail`
+instead. Since one sentinel value covers two distinct causes (a state-
+gate violation vs. a broker/send failure), call `audit_last_error()`
+after a 0 return to disambiguate them.
+
+---- audit_last_error() -> cause
+Returns the real cause of the most recent `audit_begin` call:
+`AUDIT_OK` (0) if it succeeded or none has run yet, `AUDIT_ERR_STATE`
+(1) if the IDLE gate refused it, or the verbatim
+`AUDIT_ERR_BROKER_UNAVAILABLE` (3) / `AUDIT_ERR_SEND_FAILED` (4) if its
+INVOKE send failed. Only meaningful right after an `audit_begin` call
+that returned 0.
+
 ---- audit_record_output(audit_id, output_schema_ptr, output_hash) -> err
 Record that a schema-typed output stream is about to be emitted. Called
 after any use of the streaming hash API ([[cref: HASH]]) — `output_hash`
@@ -88,9 +107,11 @@ be mutated mid-flight. Consumers that skip this call get parent = 0
 (paideia-os plan §5.2, shell.M3-003).
 
 ---- audit_can_emit_output() -> safe
-Query the sticky broker-failure flag. Returns 1 when the tool may emit
-output; 0 when a prior audit send failed and the tool MUST NOT emit any
-user-visible output — the caller exits 3. Reset by `AuditRecord::reset`.
+Returns 1 only when the sticky broker-failure flag is clear AND an
+audit is currently open (`record_state` is BEGUN or OUTPUT); 0
+otherwise — including when no audit was ever begun, or one already
+committed — and the tool MUST NOT emit any user-visible output; the
+caller exits 3. The sticky flag is reset only by `AuditRecord::reset`.
 
 ---- audit_hash_init / update / finalize
 Streaming digest over the tool's output stream. M3-001 ships FNV-1a-64

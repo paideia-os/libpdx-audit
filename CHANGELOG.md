@@ -1,5 +1,33 @@
 # libpdx-audit — CHANGELOG
 
+## Unreleased (post-v1.0.0 enhancement pass)
+
+Source-verified audit pass against the four real consumers (`rm`,
+`cp`, `pkg`, `ls`) plus a caps/wire-declaration review; see
+`design/enhancement-plan.md`. Entries below track individual
+`ENH-*` issues as they land; a version bump + CHANGELOG rollup happens
+at the next formal release cut.
+
+- **ENH-007** `caps.decl` refresh — wire schema was still described as
+  the M1 56-byte stub; now states the landed 64-byte / eight-u64-word
+  `PdxAuditRecord@0.1` shape and adds an explicit `wire_ownership`
+  block naming `AUDIT_HDR_WORD` framing as mandatory for any producer
+  on `svc.audit-journal`.
+- **ENH-005** `audit_can_emit_output` now fails closed by default:
+  requires `audit_broker_failed == 0` AND `record_state IN {BEGUN,
+  OUTPUT}`, not just the sticky flag. A process that never opened an
+  audit (or already committed one) previously read "safe" via `.bss`
+  zero-init.
+- **ENH-006** `audit_begin`'s bare `0`-on-failure sentinel conflated a
+  state-gate violation with a broker/send failure, and does not follow
+  this org's negative-errno idiom (`ls`'s consumer-side check got this
+  backwards — see the issue). New `AuditRecord::audit_last_error` slot
+  + `AuditClient::audit_last_error()` accessor exposes the real cause
+  (`AUDIT_ERR_STATE` vs. `AUDIT_ERR_BROKER_UNAVAILABLE` /
+  `AUDIT_ERR_SEND_FAILED`) after a 0 return, without changing
+  `audit_begin`'s wire-stable return convention. README + pdxdoc now
+  carry an explicit caution against the negative-errno idiom here.
+
 ## v1.0.0 — 2026-08-22 (R49 wave close, M5-001)
 
 **First release.** Signed with the paideia-release-line hybrid
