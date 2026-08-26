@@ -1,4 +1,4 @@
-// tests/test_broker_refusal.pdx — libpdx-audit.M4-001 + ENH-005
+// tests/test_broker_refusal.pdx — libpdx-audit.M4-001 + ENH-005 + ENH-008
 // Driver for the D3 audit-first "broker unavailable → tool refuses
 // output (exit 3)" invariant. Verifies the M2-002 sticky-flag guard
 // AND the ENH-005 fail-open-when-no-audit-was-ever-begun fix end to
@@ -34,8 +34,10 @@
 //   AuditRecord::reset               (src/audit_record.pdx)
 //   AuditClient::audit_can_emit_output  (src/audit_client.pdx, M2-002)
 //   AuditClient::audit_set_parent    (src/audit_client.pdx, M3-002)
+//   AuditClient::audit_broker_failure_cause (src/audit_client.pdx, ENH-008)
 // Cross-module .bss symbols read/written:
 //   audit_broker_failed              (src/audit_record.pdx, M2-002)
+//   audit_broker_failure_cause       (src/audit_record.pdx, ENH-008)
 //   audit_broker_slot                (src/audit_record.pdx)
 //   record_state                     (src/audit_record.pdx)
 //   record_parent_audit_id           (src/audit_record.pdx, M3-002)
@@ -45,8 +47,9 @@ module TestBrokerRefusal = structure {
   // ============================================================================
   // run() -> u64
   //
-  // Executes the M4-001 + ENH-005 subtest sequence in order. Returns 0
-  // on all-pass or the ordinal of the first failing subtest (1..8).
+  // Executes the M4-001 + ENH-005 + ENH-008 subtest sequence in order.
+  // Returns 0 on all-pass or the ordinal of the first failing subtest
+  // (1..10).
   //
   // Subtest ledger (each verifies one narrow invariant; ordering keeps
   // the state-shape flowing forward so a subtest failure does not cross-
@@ -71,6 +74,12 @@ module TestBrokerRefusal = structure {
   //                          also a legal "audit open" state)
   //   8  broker slot reset-> audit_broker_slot = UNRESOLVED (0xFFFF)
   //                          after reset
+  //   9  fault-inject     -> audit_broker_failure_cause =
+  //                          AUDIT_ERR_SEND_FAILED (4);
+  //                          audit_broker_failure_cause() returns 4
+  //                          verbatim (ENH-008 diagnostic accessor)
+  //  10  reset() clears   -> after reset, audit_broker_failure_cause()
+  //                          reads AUDIT_OK (0) again
   //
   // Register plan (single leaf; no nested-call preservation needed since
   // every callee is a pure leaf — reset, audit_can_emit_output —
@@ -90,7 +99,7 @@ module TestBrokerRefusal = structure {
   pub let run : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M4-001 + ENH-005: TestBrokerRefusal::run entry point. Sequential subtest driver: eight .bss-only checks against the AuditRecord state and the AuditClient::audit_can_emit_output guard, verifying both the M2-002 sticky-flag invariant AND the ENH-005 fail-closed-when-no-audit-is-open invariant that together gate every consumer stdout/stderr write per D3 audit-first (design/architecture.md §7). Subtest 2 and 6 assert the ENH-005 default: audit_can_emit_output() reads 0 immediately after reset() since record_state is IDLE (no audit open) even though audit_broker_failed is also 0 — this replaces the pre-ENH-005 expectation of 1 at those two points. Subtests 3 and 7 fault-inject record_state directly (AUDIT_STATE_BEGUN=1, then AUDIT_STATE_OUTPUT=2) to prove both legal 'audit open' states pass the guard when the sticky flag is clear. Subtest 4 fault-injects audit_broker_failed=1 while record_state is still BEGUN, proving the sticky flag outranks an open audit (matches audit_send_record's asr_bind_fail / asr_ipc_fail epilogue). Subtest 5 verifies reset() clears the sticky flag per the M2-002 doc line 'once set, only reset() clears it'. Subtest 8 verifies reset() writes AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) into audit_broker_slot — the M1-002 sentinel that gates the fast-path in audit_broker_bind. Every call in this driver is a pure leaf (reset = !{mem} @{}, audit_can_emit_output = !{mem} @{}) so no register state needs preservation across calls beyond r12/r13 which are pushed for SysV callee-save discipline + rsp % 16 alignment parity — a future refactor that introduces a non-leaf could reuse the same pair. Label prefix tbr_ per project reserved-label discipline (labels using bare 'ok'/'fail' collide with paideia-as keywords; tbr_ prefix is unique). Return code: 0 on all-pass, 1..8 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (AUDIT_OK compare / .bss zero-check / refuse return), 1 (AUDIT_STATE_BEGUN / fault-inject value / ordinals), 2 (AUDIT_STATE_OUTPUT), 3..8 (subtest ordinals), 0xFFFF (AUDIT_BROKER_SLOT_UNRESOLVED) — all within paideia-as cmp-imm bounds.",
+      justification: "libpdx-audit.M4-001 + ENH-005 + ENH-008: TestBrokerRefusal::run entry point. Sequential subtest driver: ten .bss-only checks against the AuditRecord state, the AuditClient::audit_can_emit_output guard, and the AuditClient::audit_broker_failure_cause diagnostic accessor, verifying the M2-002 sticky-flag invariant, the ENH-005 fail-closed-when-no-audit-is-open invariant, and the ENH-008 failure-cause invariant together. Subtest 2 and 6 assert the ENH-005 default: audit_can_emit_output() reads 0 immediately after reset() since record_state is IDLE (no audit open) even though audit_broker_failed is also 0 — this replaces the pre-ENH-005 expectation of 1 at those two points. Subtests 3 and 7 fault-inject record_state directly (AUDIT_STATE_BEGUN=1, then AUDIT_STATE_OUTPUT=2) to prove both legal 'audit open' states pass the guard when the sticky flag is clear. Subtest 4 fault-injects audit_broker_failed=1 while record_state is still BEGUN, proving the sticky flag outranks an open audit (matches audit_send_record's asr_bind_fail / asr_ipc_fail epilogue). Subtest 5 verifies reset() clears the sticky flag per the M2-002 doc line 'once set, only reset() clears it'. Subtest 8 verifies reset() writes AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) into audit_broker_slot — the M1-002 sentinel that gates the fast-path in audit_broker_bind. Subtest 9 fault-injects audit_broker_failure_cause=AUDIT_ERR_SEND_FAILED(4) and verifies the new accessor returns it verbatim — the ENH-008 diagnostic path a supervisor uses to tell a send failure (asr_ipc_fail) apart from a bind failure (asr_bind_fail, cause=3). Subtest 10 verifies reset() also clears the cause slot alongside the sticky flag, per the ENH-008 sticky-forever-until-reset policy documented at design/architecture.md §7.2 (audit_rearm deliberately never clears either). Every call in this driver is a pure leaf (reset, audit_can_emit_output, audit_broker_failure_cause all !{mem} @{}) so no register state needs preservation across calls beyond r12/r13 which are pushed for SysV callee-save discipline + rsp % 16 alignment parity — a future refactor that introduces a non-leaf could reuse the same pair. Label prefix tbr_ per project reserved-label discipline (labels using bare 'ok'/'fail' collide with paideia-as keywords; tbr_ prefix is unique). Return code: 0 on all-pass, 1..10 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (AUDIT_OK compare / .bss zero-check / refuse return), 1 (AUDIT_STATE_BEGUN / fault-inject value / ordinals), 2 (AUDIT_STATE_OUTPUT), 3..10 (subtest ordinals + AUDIT_ERR_BROKER_UNAVAILABLE), 4 (AUDIT_ERR_SEND_FAILED fault-inject + compare value), 0xFFFF (AUDIT_BROKER_SLOT_UNRESOLVED) — all within paideia-as cmp-imm bounds.",
       block: {
         push r12;
         push r13;
@@ -173,6 +182,27 @@ module TestBrokerRefusal = structure {
         cmp rax, 0xFFFF;
         jne tbr_fail_8;
 
+        // ---- Subtest 9 (ENH-008): fault-inject audit_broker_failure_
+        //      cause = AUDIT_ERR_SEND_FAILED (4); the accessor returns
+        //      it verbatim — the diagnostic path a supervisor uses to
+        //      tell a send failure apart from a bind failure.
+        mov rax, 4;                              // AUDIT_ERR_SEND_FAILED
+        lea r11, [rip + audit_broker_failure_cause];
+        mov [r11], rax;
+
+        call audit_broker_failure_cause;
+        cmp rax, 4;
+        jne tbr_fail_9;
+
+        // ---- Subtest 10 (ENH-008): reset() also clears the cause slot
+        //      alongside the sticky flag — both are sticky-forever
+        //      only up to the next reset(), never cleared by
+        //      audit_rearm().
+        call reset;
+        call audit_broker_failure_cause;
+        cmp rax, 0;
+        jne tbr_fail_10;
+
         // All subtests passed.
         xor rax, rax;                            // 0 = all pass
         pop r13;
@@ -223,6 +253,18 @@ module TestBrokerRefusal = structure {
 
       tbr_fail_8:
         mov rax, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      tbr_fail_9:
+        mov rax, 9;
+        pop r13;
+        pop r12;
+        ret;
+
+      tbr_fail_10:
+        mov rax, 10;
         pop r13;
         pop r12;
         ret;

@@ -26,6 +26,7 @@ libpdx-audit — audit-first output for paideia-os tools.
       pub let audit_set_parent   : (u64) -> u64 !{mem} @{}
       pub let audit_can_emit_output : () -> u64 !{} @{}
       pub let audit_last_error   : () -> u64 !{mem} @{}
+      pub let audit_broker_failure_cause : () -> u64 !{mem} @{}
     }
     module AuditHash = structure {
       pub let audit_hash_init     : () -> u64 !{mem} @{}
@@ -127,6 +128,15 @@ otherwise — including when no audit was ever begun, or one already
 committed — and the tool MUST NOT emit any user-visible output; the
 caller exits 3. The sticky flag is reset only by `AuditRecord::reset`.
 
+---- audit_broker_failure_cause() -> cause
+Post-1.0.0 (ENH-008). Diagnostic-only companion to
+`audit_can_emit_output`: once the sticky `audit_broker_failed` flag is
+set, this tells `AUDIT_ERR_BROKER_UNAVAILABLE` (bind never resolved)
+apart from `AUDIT_ERR_SEND_FAILED` (bind succeeded, send failed).
+Returns `AUDIT_OK` before any failure. Sticky-forever policy: only
+`AuditRecord::reset` clears it — this is diagnosis, not a recovery
+primitive (see [[cref: STICKY-FAILURE-POLICY]]).
+
 ---- audit_hash_init / update / finalize
 Streaming digest over the tool's output stream. M3-001 ships FNV-1a-64
 as a documented placeholder; the primitive swaps to BLAKE3-truncated
@@ -207,6 +217,26 @@ PAYLOAD_LEN / EFAULT / CHANDEAD) hard-fails immediately. Exhausted
 retries set the sticky `audit_broker_failed` flag and return
 `AUDIT_ERR_SEND_FAILED`; the caller MUST exit 3 without emitting any
 user-visible output.
+
+==== STICKY-FAILURE-POLICY
+Post-1.0.0 (ENH-008). `audit_broker_failed` is set by either failure
+epilogue of `audit_send_record` and cleared ONLY by `AuditRecord::
+reset` — never by `audit_rearm` (see [[cref: STATE-MACHINE]]) and
+never by any other entry point. This is an explicit policy decision,
+not an oversight: under D3 audit-first, a broker/journal failure is
+not a condition a process should recover from and keep emitting
+output under — a supervisor that restores the broker restarts the
+affected tool. A per-audit clear of "I failed to journal" would let a
+tool route around one failed send by opening a fresh audit, defeating
+D3.
+
+`audit_broker_failure_cause()` is a companion diagnostic-only
+accessor (not a recovery primitive) distinguishing which of the two
+`audit_send_record` failure epilogues set the sticky flag:
+`AUDIT_ERR_BROKER_UNAVAILABLE` (bind never resolved a slot) versus
+`AUDIT_ERR_SEND_FAILED` (bind succeeded, the send's retry budget
+exhausted or hard-failed). Both slots are zeroed together, only by
+`reset`.
 
 ==== PARENT-LINKAGE
 The parent-child linkage between a shell's `ShellCommandRecord` and its

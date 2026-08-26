@@ -128,6 +128,22 @@ module AuditRecord = structure {
   // value first and consult this slot only after that returns 0.
   pub let mut audit_last_error         : u64 = uninit @align(8)
 
+  // ENH-008 (post-1.0.0) failure-cause slot for the STICKY flag.
+  // audit_broker_failed only records THAT a send failed, not WHICH of
+  // the two AuditBroker::audit_send_record failure epilogues fired.
+  // Written alongside audit_broker_failed in both asr_bind_fail
+  // (AUDIT_ERR_BROKER_UNAVAILABLE=3 — svc_lookup never resolved a
+  // slot) and asr_ipc_fail (AUDIT_ERR_SEND_FAILED=4 — bind succeeded
+  // but sys_ipc_send's retry budget exhausted or hard-failed), so a
+  // supervisor reading AuditClient::audit_broker_failure_cause() can
+  // distinguish "the journal daemon was never reachable" from "the
+  // channel accepted binds but sending records to it failed". Zeroed
+  // by reset() (0 = AUDIT_OK = no failure recorded). Deliberately NOT
+  // cleared by audit_rearm() — see design/architecture.md §7.2: the
+  // sticky flag (and this cause) are sticky-forever for the lifetime
+  // of the process by explicit policy; only reset() clears them.
+  pub let mut audit_broker_failure_cause : u64 = uninit @align(8)
+
   // M3-001 streaming-hash accumulator slots. Feed the tool's output
   // stream into AuditHash::audit_hash_update as it is emitted;
   // audit_hash_finalize reads record_hash_state and returns the
@@ -200,7 +216,7 @@ module AuditRecord = structure {
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001 + M3-002 + ENH-006: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). M3-002 adds record_parent_audit_id to the zero pass so a consumer that never calls audit_set_parent gets parent = 0 (top-level) in its wire records, preserving the M2 shape. ENH-006 adds audit_last_error to the zero pass so a fresh process reads AUDIT_OK (0) from audit_last_error before any audit_begin call, matching the 'no failure yet' meaning. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001 + M3-002 + ENH-006 + ENH-008: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). M3-002 adds record_parent_audit_id to the zero pass so a consumer that never calls audit_set_parent gets parent = 0 (top-level) in its wire records, preserving the M2 shape. ENH-006 adds audit_last_error to the zero pass so a fresh process reads AUDIT_OK (0) from audit_last_error before any audit_begin call, matching the 'no failure yet' meaning. ENH-008 adds audit_broker_failure_cause to the zero pass alongside audit_broker_failed — both are sticky-forever by explicit policy (design/architecture.md §7.2) and only reset() clears either. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
       block: {
         xor rax, rax;                                    // rax = 0
         lea r11, [rip + record_audit_id];          mov [r11], rax;
@@ -215,6 +231,7 @@ module AuditRecord = structure {
         lea r11, [rip + record_hash_active];       mov [r11], rax;
         lea r11, [rip + record_parent_audit_id];   mov [r11], rax;
         lea r11, [rip + audit_last_error];         mov [r11], rax;
+        lea r11, [rip + audit_broker_failure_cause]; mov [r11], rax;
 
         mov rax, 1;                                      // audit_id_next = 1
         lea r11, [rip + audit_id_next];            mov [r11], rax;

@@ -37,6 +37,15 @@ at the next formal release cut.
   `record_op_args_ptr` / `record_state`. `audit_id_next`,
   `audit_broker_slot`, `audit_broker_failed`, and
   `record_parent_audit_id` are deliberately left untouched.
+- **ENH-008** sticky-failure recovery policy, decided explicitly:
+  `audit_broker_failed` stays sticky-forever until `reset()` — no
+  new recovery primitive, since a per-audit clear would let a tool
+  route around a failed journal send and defeat D3. New
+  `AuditRecord::audit_broker_failure_cause` slot + `AuditClient::
+  audit_broker_failure_cause()` diagnostic accessor distinguishes
+  `AUDIT_ERR_BROKER_UNAVAILABLE` (bind never resolved) from
+  `AUDIT_ERR_SEND_FAILED` (bind ok, send failed) once the sticky
+  flag is set. See `design/architecture.md` §7.2.
 
 ## v1.0.0 — 2026-08-22 (R49 wave close, M5-001)
 

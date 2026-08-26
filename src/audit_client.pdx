@@ -1,4 +1,4 @@
-// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002 + M2-001 + M2-002 + M3-002 + ENH-005 + ENH-006
+// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002 + M2-001 + M2-002 + M3-002 + ENH-005 + ENH-006 + ENH-008
 // AuditClient: three-call user-facing API — audit_begin, audit_record_
 // output, audit_commit. State-machine gating per design/architecture.md
 // §4; wire format per §2. M1-002 stitched the send path in at commit;
@@ -24,7 +24,9 @@
 //   in audit_can_emit_output, ENH-005 also gates on record_state),
 //   record_parent_audit_id (M3-002 write in audit_set_parent),
 //   audit_last_error (ENH-006 write in audit_begin, read in the new
-//   audit_last_error accessor)
+//   audit_last_error accessor), audit_broker_failure_cause (ENH-008
+//   read in the new audit_broker_failure_cause accessor; written by
+//   AuditBroker::audit_send_record)
 // Cross-module functions called (M2-001):
 //   audit_send_record  (src/audit_broker.pdx)
 //   audit_rearm        (src/audit_record.pdx, ENH-004, called from
@@ -392,6 +394,46 @@ module AuditClient = structure {
       justification: "libpdx-audit.ENH-006: audit_last_error accessor. One .bss load of AuditRecord::audit_last_error via `lea r11,[rip+audit_last_error]; mov rax,[r11]`; return verbatim. audit_begin (src/audit_client.pdx) is the sole writer: AUDIT_ERR_STATE (1) on the IDLE-gate-failure path, the verbatim audit_send_record failure code (3 or 4) on the send-failure path, AUDIT_OK (0) on success, and reset() (src/audit_record.pdx) zeroes it at process start. Pure leaf — no callee-save touched, no push/pop, no branch. Register plan: rax = load/return, r11 = LEA scratch. Effects `!{mem} @{}` — only a .bss read, no syscall, no cap consumption.",
       block: {
         lea r11, [rip + audit_last_error];
+        mov rax, [r11];
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // audit_broker_failure_cause() -> u64
+  //   rax = AUDIT_OK (0)                     if the sticky failure
+  //                                          flag has never been set
+  //       | AUDIT_ERR_BROKER_UNAVAILABLE (3) if the last-recorded
+  //                                          failure was a bind
+  //                                          failure (asr_bind_fail —
+  //                                          svc.audit-journal never
+  //                                          resolved)
+  //       | AUDIT_ERR_SEND_FAILED (4)        if the last-recorded
+  //                                          failure was a send
+  //                                          failure (asr_ipc_fail —
+  //                                          bind succeeded, retries
+  //                                          exhausted or a hard
+  //                                          sys_ipc_send error)
+  //
+  // ENH-008 (post-1.0.0). AuditClient::audit_can_emit_output() only
+  // exposes the binary sticky-flag reading; an operator diagnosing
+  // why a whole process's output got suppressed cannot tell "the
+  // journal was never reachable" from "reachable but sending failed"
+  // without this. Policy (design/architecture.md §7.2): the sticky
+  // flag AND this cause are sticky-forever for the lifetime of the
+  // process — audit_rearm() deliberately does not clear either;
+  // ONLY AuditRecord::reset() does. This is a read-only diagnostic
+  // accessor, not a recovery primitive.
+  //
+  // No callee-save touched — pure leaf.
+  // ============================================================================
+
+  pub let audit_broker_failure_cause : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.ENH-008: audit_broker_failure_cause accessor. One .bss load of AuditRecord::audit_broker_failure_cause via `lea r11,[rip+audit_broker_failure_cause]; mov rax,[r11]`; return verbatim. AuditBroker::audit_send_record (src/audit_broker.pdx) is the sole writer: AUDIT_ERR_BROKER_UNAVAILABLE (3) from asr_bind_fail, AUDIT_ERR_SEND_FAILED (4) from asr_ipc_fail; reset() (src/audit_record.pdx) zeroes it at process start, and it is the one .bss slot audit_rearm() deliberately does NOT clear (design/architecture.md §7.2 — the sticky-failure policy is sticky-forever by design, not a per-audit content field). Pure leaf — no callee-save touched, no push/pop, no branch. Register plan: rax = load/return, r11 = LEA scratch. Effects `!{mem} @{}` — only a .bss read, no syscall, no cap consumption.",
+      block: {
+        lea r11, [rip + audit_broker_failure_cause];
         mov rax, [r11];
         ret;
       }

@@ -264,6 +264,42 @@ because no consumer called this entry point yet (see README §Callers);
 once a consumer's M4 gate is wired against the old behaviour, the
 same tightening would be a breaking change.
 
+### 7.2 Sticky-failure recovery policy for long-lived consumers (ENH-008)
+
+`audit_broker_failed` is set by either failure epilogue of
+`audit_send_record` and, before ENH-008, cleared only by `reset()` —
+which re-seeds `audit_id_next = 1`, so a long-lived process (the
+motivating case is `shell`, which opens one audit per command for its
+entire lifetime) cannot safely call it between audits without
+destroying monotonicity (and, per §12, any `parent_audit_id`
+linkage). One transient failure on one child's audit therefore
+permanently suppressed output from the shell process for the rest of
+its life.
+
+**Explicit policy decision: sticky-forever is the intended contract.**
+Under D3 audit-first, "the journal is gone" is not a transient
+condition a process should try to paper over — a supervisor that
+recovers from a broker outage restarts the affected tool rather than
+asking a tainted process to keep emitting output. `audit_rearm()`
+(§5.1, ENH-004) was the natural place to introduce a narrower
+recovery primitive, and deliberately does NOT clear
+`audit_broker_failed` or `audit_broker_failure_cause` — only
+`reset()` does, exactly as before ENH-008. A consumer able to clear
+its own "I failed to journal" flag on a per-audit basis would defeat
+D3: any tool could route around one failed send by starting a fresh
+audit. No new mutation primitive is added.
+
+What ENH-008 does add is diagnosis, not recovery: a second sticky
+slot, `audit_broker_failure_cause`, records WHICH of
+`audit_send_record`'s two failure epilogues fired —
+`AUDIT_ERR_BROKER_UNAVAILABLE` (asr_bind_fail — the broker was never
+reachable) or `AUDIT_ERR_SEND_FAILED` (asr_ipc_fail — bind succeeded
+but the send's retry budget exhausted or hard-failed). Previously an
+operator saw only "output suppressed", with no way to tell those two
+operationally distinct failures apart. `AuditClient::
+audit_broker_failure_cause()` exposes it; both slots are zeroed
+together by `reset()`.
+
 ## 8. Compliance with paideia-as encoding constraints
 
 All three modules follow the constraints called out in
