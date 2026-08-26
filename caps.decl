@@ -34,9 +34,31 @@
 # unlike libpdx-argv which mutates argv in place on `--foo=bar`.
 requires: KIND_IPC_ENDPOINT(write, svc.audit-journal) via svc_lookup
 
-# Declared output schemas — the M1 wire format is a stub 56-byte
-# fixed-layout record. The full UEJ_KIND_TOOL_INVOKE / OUTPUT / EXIT
-# schema binding via libpdx-semantic-pipe lands in M3 per
-# r49-r50-plan.md §5.13 (paideia-os).
+# Declared output schemas — PdxAuditRecord@0.1 is the fixed 64-byte
+# / eight-u64-word record landed at M3-002 (grew from the M1 stub's
+# 56 bytes to carry parent_audit_id at index [7]; see
+# design/architecture.md §2). Every lifecycle send discriminates on
+# event_kind at index [1]: UEJ_KIND_TOOL_INVOKE (130), TOOL_OUTPUT
+# (132), TOOL_EXIT (133) — landed at M2-001 / M3-002, not merely
+# planned.
 declares_output_schemas:
   - PdxAuditRecord@0.1
+
+# Wire ownership — ENH-007. `svc.audit-journal` is a single shared
+# broker endpoint; every producer that sends to the cap slot resolved
+# by `sys_svc_lookup("svc.audit-journal")` MUST frame its payload with
+# AUDIT_HDR_WORD (0x0000_0040_0000_0120 — op 0x20 AUDIT_EVENT, ver 1,
+# reply_ep 0, payload_len 64) and MUST marshal the eight-u64
+# PdxAuditRecord@0.1 layout byte-for-byte (design/architecture.md §2).
+# There is no per-producer discriminator on this endpoint at R49 — a
+# second producer framing a different-shaped payload (e.g. a caller
+# with its own hand-rolled svc_lookup/ipc_send trampolines instead of
+# linking this library) puts an undecodable record on the wire the
+# moment a real audit-journal daemon body lands. libpdx-audit is the
+# **only** sanctioned producer implementation of this frame; any
+# consumer emitting audit events to this broker name must link this
+# library rather than reimplementing the wire format locally.
+wire_ownership:
+  endpoint: svc.audit-journal
+  frame_header: AUDIT_HDR_WORD
+  record_schema: PdxAuditRecord@0.1
