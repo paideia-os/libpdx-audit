@@ -221,6 +221,22 @@ M1 has no retry: a single send attempt either succeeds or hard-fails.
 This is intentional — M2 tests will need to observe the hard-fail
 edge before a retry layer is meaningful.
 
+### 7.1 `audit_can_emit_output` fail-closed default (ENH-005)
+
+`AuditClient::audit_can_emit_output()` is the guard consumers wrap
+every stdout/stderr write in. Through v1.0.0 it read only the sticky
+`audit_broker_failed` flag, which meant a process that never called
+`audit_begin` at all — or one whose audit already committed — read
+`1` (safe) via `.bss` zero-init, since the flag rises only on a
+*failed* send, never an *absent* audit. Post-1.0.0 the guard requires
+BOTH `audit_broker_failed == 0` AND `record_state IN {BEGUN, OUTPUT}`.
+A tool that forgets to open an audit, or checks the guard after
+`audit_commit` has already returned the record to `IDLE`, now
+correctly refuses. This was safe to tighten immediately after v1.0.0
+because no consumer called this entry point yet (see README §Callers);
+once a consumer's M4 gate is wired against the old behaviour, the
+same tightening would be a breaking change.
+
 ## 8. Compliance with paideia-as encoding constraints
 
 All three modules follow the constraints called out in

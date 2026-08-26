@@ -273,10 +273,17 @@ module AuditClient = structure {
   // Returns 0 if the sticky AuditRecord::audit_broker_failed flag has
   // been set by any prior audit_send_record failure (either broker-
   // unreachable at bind time or sys_ipc_send returning non-zero); this
-  // is the "refuse output" signal. Returns 1 otherwise. .bss zeroing
-  // means the flag reads 0 (safe) before any send has been attempted;
-  // a caller who invokes audit_can_emit_output before audit_begin gets
-  // the correct "no prior failure" answer.
+  // is the "refuse output" signal.
+  //
+  // ENH-005 (post-1.0.0): ALSO returns 0 when no audit is currently
+  // open — i.e. record_state is not BEGUN or OUTPUT. The D3 contract
+  // is "a tool whose output was not journalled is a tool whose output
+  // the operator cannot trust", which covers a tool that never called
+  // audit_begin (or already committed) just as much as one whose send
+  // failed. .bss zero-init previously made a never-audited process
+  // read 1 (safe) here — a fail-open default on the one primitive
+  // whose whole job is to fail closed. Returns 1 only when
+  // audit_broker_failed == 0 AND record_state IN {BEGUN, OUTPUT}.
   //
   // Consumers typically wire this as:
   //
@@ -294,13 +301,24 @@ module AuditClient = structure {
   pub let audit_can_emit_output : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M2-002: audit_can_emit_output guard. One .bss load of AuditRecord::audit_broker_failed via `lea r11,[rip+audit_broker_failed]; mov rax,[r11]`; then `cmp rax, 0` (no test mnemonic per paideia-as conformance). On flag == 0 return 1 (safe to emit output); on flag != 0 return 0 (refuse output, exit 3 per I4). Pure leaf — no callee-save touched, no push/pop. Register plan: rax = flag-load / return, r11 = LEA scratch. Effects `!{mem} @{}` — only a .bss read, no syscall, no cap consumption. Immediates: 0 (flag compare) + 1 (safe return value) — both within paideia-as cmp-imm bounds.",
+      justification: "libpdx-audit.M2-002 + ENH-005: audit_can_emit_output guard. Two gates now, both must pass: (1) AuditRecord::audit_broker_failed == 0 via `lea r11,[rip+audit_broker_failed]; mov rax,[r11]; cmp rax, 0` (no test mnemonic per paideia-as conformance) — on nonzero, refuse; (2) record_state IN {AUDIT_STATE_BEGUN(1), AUDIT_STATE_OUTPUT(2)} — on any other state (IDLE 0 or COMMITTED 3), refuse. ENH-005 rationale: .bss zero-init previously made audit_can_emit_output return 1 (safe) for a process that never called audit_begin at all, since the sticky flag only rises on a *failed* send, never an *absent* audit — backwards for the one primitive whose job is to fail closed. Gate order matches every other entry point's state-before-content discipline. Pure leaf — no callee-save touched, no push/pop; rcx holds the state-load so rax (the sticky-flag load) is not needed again once gate 1 passes. Register plan: rax = flag-load / return, rcx = state-load, r11 = LEA scratch. Effects `!{mem} @{}` — only .bss reads, no syscall, no cap consumption. Immediates: 0 (flag compare + refuse return), 1 (AUDIT_STATE_BEGUN), 2 (AUDIT_STATE_OUTPUT) — all within paideia-as cmp-imm bounds.",
       block: {
+        // ---- Gate 1: sticky send-failure flag must be clear. ----------
         lea r11, [rip + audit_broker_failed];
         mov rax, [r11];
         cmp rax, 0;
         jne audit_cee_no;
 
+        // ---- Gate 2 (ENH-005): an audit must actually be open. --------
+        lea r11, [rip + record_state];
+        mov rcx, [r11];
+        cmp rcx, 1;                              // AUDIT_STATE_BEGUN
+        je  audit_cee_yes;
+        cmp rcx, 2;                              // AUDIT_STATE_OUTPUT
+        je  audit_cee_yes;
+        jmp audit_cee_no;
+
+      audit_cee_yes:
         mov rax, 1;                              // safe to emit output
         ret;
 

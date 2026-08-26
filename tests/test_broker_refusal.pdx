@@ -1,11 +1,11 @@
-// tests/test_broker_refusal.pdx — libpdx-audit.M4-001
+// tests/test_broker_refusal.pdx — libpdx-audit.M4-001 + ENH-005
 // Driver for the D3 audit-first "broker unavailable → tool refuses
 // output (exit 3)" invariant. Verifies the M2-002 sticky-flag guard
-// end to end at the API surface, using .bss fault-injection to
-// simulate the failure the kernel-side svc.audit-journal miss would
-// otherwise raise. See design/architecture.md §7 (send failure
-// discipline) and §13 (test discipline) for the invariant this
-// covers.
+// AND the ENH-005 fail-open-when-no-audit-was-ever-begun fix end to
+// end at the API surface, using .bss fault-injection to simulate the
+// failure the kernel-side svc.audit-journal miss would otherwise
+// raise. See design/architecture.md §7 (send failure discipline) and
+// §13 (test discipline) for the invariant this covers.
 //
 // Return convention (matches every M4 test driver in this repo):
 //
@@ -45,20 +45,32 @@ module TestBrokerRefusal = structure {
   // ============================================================================
   // run() -> u64
   //
-  // Executes the M4-001 subtest sequence in order. Returns 0 on all-pass
-  // or the ordinal of the first failing subtest (1..7).
+  // Executes the M4-001 + ENH-005 subtest sequence in order. Returns 0
+  // on all-pass or the ordinal of the first failing subtest (1..8).
   //
   // Subtest ledger (each verifies one narrow invariant; ordering keeps
   // the state-shape flowing forward so a subtest failure does not cross-
   // contaminate a later subtest's expectations):
   //
   //   1  reset()          -> audit_broker_failed = 0 (fresh install: safe)
-  //   2  guard-safe path  -> audit_can_emit_output() == 1 after reset
-  //   3  fault-inject     -> write 1 into audit_broker_failed .bss slot
-  //   4  guard-refuse path-> audit_can_emit_output() == 0 with flag set
+  //   2  ENH-005 gate     -> audit_can_emit_output() == 0 right after
+  //                          reset (no audit open yet — fail-closed by
+  //                          default, superseding the old M2-002-only
+  //                          expectation of 1 here)
+  //   3  fault-inject     -> record_state = AUDIT_STATE_BEGUN (1);
+  //                          audit_can_emit_output() == 1 (audit open,
+  //                          no send failure — safe)
+  //   4  fault-inject     -> write 1 into audit_broker_failed .bss slot
+  //                          (audit still open); guard returns 0 — the
+  //                          sticky flag outranks an open audit
   //   5  reset() clears   -> after reset, flag reads 0 again
-  //   6  guard-safe again -> audit_can_emit_output() == 1 after re-reset
-  //   7  broker slot reset-> audit_broker_slot = UNRESOLVED (0xFFFF) after reset
+  //   6  ENH-005 gate     -> audit_can_emit_output() == 0 again after
+  //                          re-reset (no audit open)
+  //   7  fault-inject     -> record_state = AUDIT_STATE_OUTPUT (2);
+  //                          audit_can_emit_output() == 1 (OUTPUT is
+  //                          also a legal "audit open" state)
+  //   8  broker slot reset-> audit_broker_slot = UNRESOLVED (0xFFFF)
+  //                          after reset
   //
   // Register plan (single leaf; no nested-call preservation needed since
   // every callee is a pure leaf — reset, audit_can_emit_output —
@@ -78,7 +90,7 @@ module TestBrokerRefusal = structure {
   pub let run : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M4-001: TestBrokerRefusal::run entry point. Sequential subtest driver: seven .bss-only checks against the AuditRecord state and the AuditClient::audit_can_emit_output guard, verifying the M2-002 sticky-flag invariant that gates every consumer stdout/stderr write per D3 audit-first (design/architecture.md §7). Fault injection at subtest 3 writes 1 into audit_broker_failed via `mov rax,1; lea r11,[rip+audit_broker_failed]; mov [r11],rax` (parser.pdx cross-module-write pattern); subtest 4 verifies the guard reads that write and returns 0 (refuse). Subtest 5 verifies reset() clears the sticky flag per the M2-002 doc line 'once set, only reset() clears it'. Subtest 7 verifies reset() writes AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) into audit_broker_slot — the M1-002 sentinel that gates the fast-path in audit_broker_bind. Every call in this driver is a pure leaf (reset = !{mem} @{}, audit_can_emit_output = !{mem} @{}) so no register state needs preservation across calls beyond r12/r13 which are pushed for SysV callee-save discipline + rsp % 16 alignment parity — a future refactor that introduces a non-leaf could reuse the same pair. Label prefix tbr_ per project reserved-label discipline (labels using bare 'ok'/'fail' collide with paideia-as keywords; tbr_ prefix is unique). Return code: 0 on all-pass, 1..7 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (AUDIT_OK compare / .bss zero-check), 1 (safe-guard return / fault-inject value / ordinals), 2..7 (subtest ordinals), 0xFFFF (AUDIT_BROKER_SLOT_UNRESOLVED) — all within paideia-as cmp-imm bounds.",
+      justification: "libpdx-audit.M4-001 + ENH-005: TestBrokerRefusal::run entry point. Sequential subtest driver: eight .bss-only checks against the AuditRecord state and the AuditClient::audit_can_emit_output guard, verifying both the M2-002 sticky-flag invariant AND the ENH-005 fail-closed-when-no-audit-is-open invariant that together gate every consumer stdout/stderr write per D3 audit-first (design/architecture.md §7). Subtest 2 and 6 assert the ENH-005 default: audit_can_emit_output() reads 0 immediately after reset() since record_state is IDLE (no audit open) even though audit_broker_failed is also 0 — this replaces the pre-ENH-005 expectation of 1 at those two points. Subtests 3 and 7 fault-inject record_state directly (AUDIT_STATE_BEGUN=1, then AUDIT_STATE_OUTPUT=2) to prove both legal 'audit open' states pass the guard when the sticky flag is clear. Subtest 4 fault-injects audit_broker_failed=1 while record_state is still BEGUN, proving the sticky flag outranks an open audit (matches audit_send_record's asr_bind_fail / asr_ipc_fail epilogue). Subtest 5 verifies reset() clears the sticky flag per the M2-002 doc line 'once set, only reset() clears it'. Subtest 8 verifies reset() writes AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) into audit_broker_slot — the M1-002 sentinel that gates the fast-path in audit_broker_bind. Every call in this driver is a pure leaf (reset = !{mem} @{}, audit_can_emit_output = !{mem} @{}) so no register state needs preservation across calls beyond r12/r13 which are pushed for SysV callee-save discipline + rsp % 16 alignment parity — a future refactor that introduces a non-leaf could reuse the same pair. Label prefix tbr_ per project reserved-label discipline (labels using bare 'ok'/'fail' collide with paideia-as keywords; tbr_ prefix is unique). Return code: 0 on all-pass, 1..8 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (AUDIT_OK compare / .bss zero-check / refuse return), 1 (AUDIT_STATE_BEGUN / fault-inject value / ordinals), 2 (AUDIT_STATE_OUTPUT), 3..8 (subtest ordinals), 0xFFFF (AUDIT_BROKER_SLOT_UNRESOLVED) — all within paideia-as cmp-imm bounds.",
       block: {
         push r12;
         push r13;
@@ -90,21 +102,33 @@ module TestBrokerRefusal = structure {
         cmp rax, 0;
         jne tbr_fail_1;
 
-        // ---- Subtest 2: guard returns 1 (safe) after reset. ----------
+        // ---- Subtest 2 (ENH-005): guard refuses — no audit open yet. -
         call audit_can_emit_output;
-        cmp rax, 1;
+        cmp rax, 0;
         jne tbr_fail_2;
 
-        // ---- Subtest 3: fault-inject a sticky failure via .bss write.
+        // ---- Subtest 3: fault-inject record_state = BEGUN (1); guard
+        //      now returns 1 (audit open, no send failure — safe).
+        mov rax, 1;                              // AUDIT_STATE_BEGUN
+        lea r11, [rip + record_state];
+        mov [r11], rax;
+
+        call audit_can_emit_output;
+        cmp rax, 1;
+        jne tbr_fail_3;
+
+        // ---- Subtest 4: fault-inject a sticky failure via .bss write,
+        //      audit still open (record_state == BEGUN from subtest 3).
         //      The invariant being tested is "any prior send failure
-        //      taints the whole invocation." Writing 1 here simulates
-        //      the M2-002 write from audit_send_record's asr_bind_fail
-        //      or asr_ipc_fail epilogue.
+        //      taints the whole invocation, even with an open audit."
+        //      Writing 1 here simulates the M2-002 write from
+        //      audit_send_record's asr_bind_fail or asr_ipc_fail
+        //      epilogue.
         mov rax, 1;
         lea r11, [rip + audit_broker_failed];
         mov [r11], rax;
 
-        // ---- Subtest 4: guard returns 0 (refuse) with flag set. ------
+        // ---- Subtest 4b: guard returns 0 (refuse) with flag set. -----
         //      This is the load-bearing D3 assertion — the consumer's
         //      test harness (once wired) will exit 3 and emit no output
         //      when this returns 0.
@@ -119,12 +143,23 @@ module TestBrokerRefusal = structure {
         cmp rax, 0;
         jne tbr_fail_5;
 
-        // ---- Subtest 6: guard returns 1 (safe) again after clear. ----
+        // ---- Subtest 6 (ENH-005): guard refuses again — no audit
+        //      open after re-reset.
         call audit_can_emit_output;
-        cmp rax, 1;
+        cmp rax, 0;
         jne tbr_fail_6;
 
-        // ---- Subtest 7: reset() also primes audit_broker_slot to
+        // ---- Subtest 7: fault-inject record_state = OUTPUT (2); guard
+        //      returns 1 — OUTPUT is also a legal "audit open" state.
+        mov rax, 2;                              // AUDIT_STATE_OUTPUT
+        lea r11, [rip + record_state];
+        mov [r11], rax;
+
+        call audit_can_emit_output;
+        cmp rax, 1;
+        jne tbr_fail_7;
+
+        // ---- Subtest 8: reset() also primes audit_broker_slot to
         //      AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). Verifying this
         //      is part of the broker-refusal contract: a fresh reset()
         //      must leave the bind-cache in the state that forces the
@@ -132,10 +167,11 @@ module TestBrokerRefusal = structure {
         //      (which would fail broker-unavailable in the M4-001
         //      QEMU environment, propagating AUDIT_ERR_BROKER_
         //      UNAVAILABLE and setting the sticky flag again).
+        call reset;
         lea r11, [rip + audit_broker_slot];
         mov rax, [r11];
         cmp rax, 0xFFFF;
-        jne tbr_fail_7;
+        jne tbr_fail_8;
 
         // All subtests passed.
         xor rax, rax;                            // 0 = all pass
@@ -151,6 +187,12 @@ module TestBrokerRefusal = structure {
 
       tbr_fail_2:
         mov rax, 2;
+        pop r13;
+        pop r12;
+        ret;
+
+      tbr_fail_3:
+        mov rax, 3;
         pop r13;
         pop r12;
         ret;
@@ -175,6 +217,12 @@ module TestBrokerRefusal = structure {
 
       tbr_fail_7:
         mov rax, 7;
+        pop r13;
+        pop r12;
+        ret;
+
+      tbr_fail_8:
+        mov rax, 8;
         pop r13;
         pop r12;
         ret;
