@@ -97,6 +97,12 @@ read-only tool that emits no schema-typed output may skip this and go
 straight to commit. On success transitions BEGUN → OUTPUT and issues an
 OUTPUT event.
 
+Post-1.0.0 (ENH-003): re-entrant from OUTPUT — a second/third call on
+the same open audit is legal (was `AUDIT_ERR_STATE` through v1.0.0)
+and emits its own OUTPUT event. A multi-target operation (e.g. `rm a b
+c`) may call this once per target instead of losing every target past
+the first.
+
 ---- audit_commit(audit_id, exit_code) -> err
 Close the audit. Legal from BEGUN or OUTPUT; on success transitions to
 COMMITTED, issues an EXIT event, then resets to IDLE so a subsequent
@@ -194,6 +200,11 @@ audit_id = 0x2a).
 Every entry point validates the state gate BEFORE the audit_id gate;
 this ordering surfaces a stale `audit_id` passed after commit as
 `AUDIT_ERR_STATE`, not `AUDIT_ERR_ID_MISMATCH`.
+
+Post-1.0.0 (ENH-003): `audit_record_output` is re-entrant from OUTPUT
+— OUTPUT is a legal predecessor of itself, each call emitting its own
+OUTPUT event. Purely additive; no wire-format change, no new error
+code.
 
 ==== ERROR-CODES
     AUDIT_OK                    = 0

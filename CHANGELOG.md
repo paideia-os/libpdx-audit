@@ -46,6 +46,16 @@ at the next formal release cut.
   `AUDIT_ERR_BROKER_UNAVAILABLE` (bind never resolved) from
   `AUDIT_ERR_SEND_FAILED` (bind ok, send failed) once the sticky
   flag is set. See `design/architecture.md` §7.2.
+- **ENH-003** `audit_record_output` is now re-entrant from `OUTPUT`
+  (gate widened from `BEGUN`-only to `BEGUN || OUTPUT`, mirroring
+  `audit_commit`'s existing dual-state gate). Through v1.0.0 a second
+  call on one open audit hard-failed with `AUDIT_ERR_STATE` — a real
+  gap for `rm`, whose `RmAudit::audit_record_target` journals every
+  successful removal target from two call sites, so `rm a b c` only
+  ever recorded target `a`. Purely additive: no wire-format change,
+  no new error code. Not covered by a runnable test driver — like
+  every other syscall-touching entry point in this repo, verified by
+  code review only (see `design/enhancement-plan.md` §1.2).
 
 ## v1.0.0 — 2026-08-22 (R49 wave close, M5-001)
 

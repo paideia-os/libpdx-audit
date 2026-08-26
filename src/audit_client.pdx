@@ -163,8 +163,13 @@ module AuditClient = structure {
   //   rax = AUDIT_OK on success; AUDIT_ERR_STATE or AUDIT_ERR_ID_MISMATCH
   //         on gate failure.
   //
-  // Requires record_state == AUDIT_STATE_BEGUN and audit_id ==
-  // record_audit_id. Transitions record_state to AUDIT_STATE_OUTPUT.
+  // Requires record_state == AUDIT_STATE_BEGUN OR AUDIT_STATE_OUTPUT
+  // (ENH-003, post-1.0.0 — was BEGUN-only through v1.0.0) and
+  // audit_id == record_audit_id. Transitions/re-enters
+  // AUDIT_STATE_OUTPUT and emits its own UEJ_KIND_TOOL_OUTPUT send
+  // every call, so a multi-target operation (e.g. `rm a b c`) can
+  // journal one OUTPUT record per target on a single open audit
+  // instead of hitting a one-output-per-audit ceiling.
   //
   // Optional per §4 of design/architecture.md: a read-only tool that
   // emits no schema-typed output may skip this and go straight to
@@ -174,14 +179,21 @@ module AuditClient = structure {
   pub let audit_record_output : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (audit_id: u64) (output_schema: u64) (output_hash: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "libpdx-audit.M1-001 + M2-001: audit_record_output entry point. Two gates evaluated in order (state before id, per §4 of design/architecture.md — a stale id passed after commit surfaces as AUDIT_ERR_STATE, not AUDIT_ERR_ID_MISMATCH): (1) record_state == AUDIT_STATE_BEGUN (1); (2) rdi == record_audit_id. On both passing, store output_schema into record_output_schema_ptr, output_hash into record_output_hash, transition record_state BEGUN -> OUTPUT (2). M2-001 upgrade: after the state transition, call AuditBroker::audit_send_record(UEJ_KIND_TOOL_OUTPUT=132) so the supervisor sees the output-record event. Return audit_send_record's code verbatim — AUDIT_OK on send success, AUDIT_ERR_BROKER_UNAVAILABLE (3) or AUDIT_ERR_SEND_FAILED (4) on failure. Consumer's I4 contract on any non-OK: exit 3 with no output emission. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Effects widened from M1's !{mem} @{} to !{mem, sysreg} @{cap, sched} matching audit_send_record. Leaf w.r.t. callee-saves — output_schema/output_hash captured into .bss before the send call so no arg preservation needed; audit_send_record preserves rbx/r12..r15 by SysV. Register plan: rax = state-load / return code, rcx unused, r11 = LEA scratch, rdi = audit_id (validated) then event_kind arg to audit_send_record. Immediates: 1 (BEGUN gate + AUDIT_ERR_STATE), 2 (state transition + AUDIT_ERR_ID_MISMATCH), 132 (UEJ_KIND_TOOL_OUTPUT) — all within paideia-as cmp-imm bounds.",
+      justification: "libpdx-audit.M1-001 + M2-001 + ENH-003: audit_record_output entry point. Two gates evaluated in order (state before id, per §4 of design/architecture.md — a stale id passed after commit surfaces as AUDIT_ERR_STATE, not AUDIT_ERR_ID_MISMATCH): (1) record_state == AUDIT_STATE_BEGUN (1) OR AUDIT_STATE_OUTPUT (2) — ENH-003 widens this from the v1.0.0 BEGUN-only gate so a second/third call on the same open audit re-enters OUTPUT rather than hard-failing with AUDIT_ERR_STATE, matching audit_commit's existing dual-state-gate pattern (cmp/je/cmp/je rather than a single cmp/jne); (2) rdi == record_audit_id. On both passing, store output_schema into record_output_schema_ptr, output_hash into record_output_hash, (re-)transition record_state to OUTPUT (2) — a no-op store when already OUTPUT, but keeping the explicit write means this function's behavior does not depend on which gate branch matched. M2-001 upgrade: after the state transition, call AuditBroker::audit_send_record(UEJ_KIND_TOOL_OUTPUT=132) so the supervisor sees the output-record event — ENH-003 means a multi-target operation emits one OUTPUT send per audit_record_output call, each carrying that call's own output_schema/output_hash, letting a supervisor replay every target of e.g. `rm a b c` individually instead of losing all but the first to AUDIT_ERR_STATE. Return audit_send_record's code verbatim — AUDIT_OK on send success, AUDIT_ERR_BROKER_UNAVAILABLE (3) or AUDIT_ERR_SEND_FAILED (4) on failure. Consumer's I4 contract on any non-OK: exit 3 with no output emission. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Effects widened from M1's !{mem} @{} to !{mem, sysreg} @{cap, sched} matching audit_send_record. Leaf w.r.t. callee-saves — output_schema/output_hash captured into .bss before the send call so no arg preservation needed; audit_send_record preserves rbx/r12..r15 by SysV. Register plan: rax = state-load / return code, rcx unused, r11 = LEA scratch, rdi = audit_id (validated) then event_kind arg to audit_send_record. Immediates: 1 (BEGUN gate), 2 (OUTPUT gate + state transition + AUDIT_ERR_ID_MISMATCH), 132 (UEJ_KIND_TOOL_OUTPUT) — all within paideia-as cmp-imm bounds.",
       block: {
-        // ---- Gate 1: record_state must be BEGUN (1) ------------------
+        // ---- Gate 1: record_state must be BEGUN (1) OR OUTPUT (2) ----
+        //      (ENH-003: OUTPUT is now also a legal predecessor, so a
+        //      second/third call on the same open audit re-enters
+        //      OUTPUT instead of hard-failing.)
         lea r11, [rip + record_state];
         mov rax, [r11];
         cmp rax, 1;                              // AUDIT_STATE_BEGUN
-        jne audit_ro_bad_state;
+        je  audit_ro_state_ok;
+        cmp rax, 2;                              // AUDIT_STATE_OUTPUT
+        je  audit_ro_state_ok;
+        jmp audit_ro_bad_state;
 
+      audit_ro_state_ok:
         // ---- Gate 2: audit_id must match ------------------------------
         lea r11, [rip + record_audit_id];
         mov rax, [r11];
@@ -194,7 +206,10 @@ module AuditClient = structure {
         lea r11, [rip + record_output_hash];
         mov [r11], rdx;
 
-        // ---- Transition BEGUN -> OUTPUT ------------------------------
+        // ---- Transition/re-enter OUTPUT (2) ---------------------------
+        //      (ENH-003: a no-op store when already OUTPUT, but keeping
+        //      the explicit write means behavior doesn't depend on which
+        //      gate branch matched above.)
         mov rax, 2;                              // AUDIT_STATE_OUTPUT
         lea r11, [rip + record_state];
         mov [r11], rax;

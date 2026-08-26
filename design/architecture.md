@@ -135,8 +135,9 @@ caller-owned `AuditRecord*` variant, not a rework of the M1 API.
                                     │
                                     │ audit_record_output
                                     ▼
-                                  AUDIT_STATE_OUTPUT
-                                    │
+                     audit_record_output          (ENH-003: OUTPUT is
+                    (loops on itself) ⟲ AUDIT_STATE_OUTPUT   a legal predecessor
+                                    │                        of itself — re-entrant)
                                     │ audit_commit
                                     ▼
                                   AUDIT_STATE_COMMITTED
@@ -148,14 +149,39 @@ caller-owned `AuditRecord*` variant, not a rework of the M1 API.
 ```
 
 - `audit_begin` requires `record_state == IDLE` (else `AUDIT_ERR_STATE`).
-- `audit_record_output` requires `record_state == BEGUN` and
+- `audit_record_output` requires `record_state == BEGUN || record_state
+  == OUTPUT` (post-1.0.0, ENH-003 — was BEGUN-only through v1.0.0) and
   `audit_id == record_audit_id`. It is optional — a read-only tool
   that emits no schema-typed output may skip it and go straight to
-  `audit_commit`.
+  `audit_commit`. Being re-entrant from OUTPUT lets a multi-target
+  operation (e.g. `rm a b c`) call it once per target on a single
+  open audit, each call emitting its own `UEJ_KIND_TOOL_OUTPUT` send
+  — see §4.1.
 - `audit_commit` requires `record_state == BEGUN || record_state ==
   OUTPUT` (both are legal predecessors) and `audit_id ==
   record_audit_id`. On success it resets to `IDLE` so a subsequent
   `audit_begin` in the same process can start a fresh record.
+
+### 4.1 Repeated `audit_record_output` within one audit (ENH-003)
+
+Through v1.0.0, `audit_record_output`'s state gate accepted only
+`BEGUN`, so a second call on the same open audit saw `record_state ==
+OUTPUT`, failed the gate, and returned `AUDIT_ERR_STATE` — silently,
+from the caller's perspective, since most M3-era consumers treated a
+record failure as non-fatal. `rm` is the motivating counter-example:
+`RmAudit::audit_record_target` is documented to journal "every
+successful removal", and `rm`'s remove path calls it once per target
+from two call sites. For `rm a b c`, only target `a`'s OUTPUT record
+landed; `b` and `c` were dropped on the floor, and a destructive
+multi-target operation lost the forensic record of everything past
+the first target.
+
+The fix widens the gate to `BEGUN || OUTPUT`, mirroring
+`audit_commit`'s existing dual-state pattern. This is purely additive
+— no wire-format change, no new error code, no removed behaviour — so
+every existing single-output caller is unaffected, and a caller that
+never invokes `audit_record_output` more than once per audit sees no
+behavioural difference at all.
 
 Every entry point validates the state gate BEFORE the audit_id gate;
 this ordering is deliberate — a stale audit_id passed to
