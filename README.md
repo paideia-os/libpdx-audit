@@ -77,6 +77,16 @@ declaration.
 process). Zeroes the in-progress slots, then seeds `audit_id_next = 1`
 and `audit_broker_slot = 0xFFFF`.
 
+`audit_rearm() -> () !{mem} @{}` — post-1.0.0 (ENH-004). Clears exactly
+the per-audit content slots a prior `audit_record_output` /
+`audit_commit` may have populated (`record_exit_code`,
+`record_output_schema_ptr`, `record_output_hash`) without touching
+`audit_id_next`, `audit_broker_slot`, `audit_broker_failed`, or
+`record_parent_audit_id`. `audit_begin` now calls this automatically
+right after its IDLE gate passes, so a second audit in one process no
+longer inherits the first audit's stale exit code / schema pointer /
+output hash into its own INVOKE payload.
+
 Exported constants:
 
 - Error codes — `AUDIT_OK` 0, `AUDIT_ERR_STATE` 1,

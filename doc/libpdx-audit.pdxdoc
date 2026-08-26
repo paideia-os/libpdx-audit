@@ -15,7 +15,10 @@
 libpdx-audit — audit-first output for paideia-os tools.
 
 ==== SYNOPSIS
-    module AuditRecord = structure { ... }
+    module AuditRecord = structure {
+      pub let reset       : () -> () !{mem} @{}
+      pub let audit_rearm : () -> () !{mem} @{}
+    }
     module AuditClient = structure {
       pub let audit_begin        : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
       pub let audit_record_output: (u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
@@ -97,6 +100,17 @@ OUTPUT event.
 Close the audit. Legal from BEGUN or OUTPUT; on success transitions to
 COMMITTED, issues an EXIT event, then resets to IDLE so a subsequent
 `audit_begin` in the same process starts a fresh record.
+
+---- audit_rearm() -> ()
+Post-1.0.0 (ENH-004). Clears exactly the per-audit CONTENT slots a
+prior audit populated — `record_exit_code`, `record_output_schema_ptr`,
+`record_output_hash` — without touching `audit_id_next`,
+`audit_broker_slot`, `audit_broker_failed`, or
+`record_parent_audit_id`. `audit_begin` calls this automatically right
+after its IDLE gate passes, so a second audit in one long-lived process
+no longer inherits the previous audit's stale exit code / schema
+pointer / output hash into its own INVOKE payload. Also exported
+standalone for symmetry with `reset()`.
 
 ---- audit_set_parent(parent_audit_id) -> err
 Set the parent audit id for the next `audit_begin`. Legal ONLY from

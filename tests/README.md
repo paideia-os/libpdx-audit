@@ -14,16 +14,18 @@ Both landed at M4.
 
 - `test_broker_refusal.pdx` — M4-001 driver. Exports
   `TestBrokerRefusal::run() -> u64`. Verifies the M2-002 sticky-flag
-  guard end-to-end at the API surface via .bss fault-injection.
-  Returns 0 on pass or a 1..7 subtest ordinal on failure. Pure leaf
+  guard AND the ENH-005 fail-closed-when-no-audit-is-open guard
+  end-to-end at the API surface via .bss fault-injection. Returns 0
+  on pass or a 1..8 subtest ordinal on failure. Pure leaf
   (effects `!{mem} @{}` — no syscall).
 - `test_replay_golden.pdx` — M4-002 driver. Exports
   `TestReplayGolden::run() -> u64`. Verifies the wire-format
   invariants that a supervisor replaying the audit journal depends
   on — state-machine reset, FNV-1a-64 empty-stream self-check,
   hash active-flag gates, len=0 no-op, parent-linkage propagation
-  into the .bss slot marshal reads. Returns 0 on pass or a 1..8
-  subtest ordinal on failure. Pure leaf (effects `!{mem} @{}`).
+  into the .bss slot marshal reads, and (ENH-004) the audit_rearm
+  selective-clear contract. Returns 0 on pass or a 1..9 subtest
+  ordinal on failure. Pure leaf (effects `!{mem} @{}`).
 - `goldens/trace_001.md` — the M4-002 wire-bytes fixture (64-byte
   payload + header layout, per INVOKE / OUTPUT / EXIT lifecycle
   send). Documents the byte-for-byte contract the QEMU harness

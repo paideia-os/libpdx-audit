@@ -178,6 +178,33 @@ paideia-as encodes 64-bit compares via r11 spill for values above
 `0x7FFFFFFF` per the encoder's r11-load discipline, so we route the
 comparison through r11 in `audit_client.pdx`).
 
+### 5.1 `audit_rearm` — per-audit content clearing (ENH-004)
+
+`reset()` is a process-scoped, call-once primitive: it re-seeds
+`audit_id_next = 1`, which a second audit in the same process MUST
+NOT observe (monotonicity would break, and per §12 so would any
+`parent_audit_id` linkage). But nothing before ENH-004 cleared
+`record_exit_code`, `record_output_schema_ptr`, or
+`record_output_hash` between audits — only `record_audit_id`,
+`record_op_name_ptr`, `record_op_args_ptr`, and `record_state` get
+overwritten by `audit_begin`. A second audit in a long-lived process
+(the motivating case is a shell running one audit per command)
+therefore emitted an INVOKE payload carrying the FIRST audit's exit
+code / schema pointer / output hash at wire indices [2] / [5] / [6].
+
+`AuditRecord::audit_rearm()` clears exactly those three content slots.
+`audit_begin` calls it automatically immediately after its IDLE gate
+passes and before allocating the new id, so the fix requires no new
+caller discipline. It deliberately does NOT clear `audit_id_next`,
+`audit_broker_slot`, or `audit_broker_failed` (all process-scoped;
+see §7.2 for why `audit_broker_failed` recovery is a separate,
+narrower policy decision), and does NOT clear
+`record_parent_audit_id` — `audit_set_parent` writes that slot BEFORE
+`audit_begin` while state is still IDLE, and `audit_begin` invokes
+`audit_rearm` right after its own IDLE gate, so clearing the parent
+slot here would erase what `audit_set_parent` just wrote for the
+audit about to begin.
+
 ## 6. svc.audit-journal broker binding (M1-002)
 
 `AuditBroker::audit_broker_bind()` returns `AUDIT_OK` on success and

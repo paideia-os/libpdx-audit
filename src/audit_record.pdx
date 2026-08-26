@@ -1,4 +1,4 @@
-// src/audit_record.pdx — libpdx-audit.M1-001
+// src/audit_record.pdx — libpdx-audit.M1-001 + M2-002 + M3-001 + M3-002 + ENH-004 + ENH-006
 // AuditRecord: singleton .bss storage for one active audit record.
 // See design/architecture.md §2–§4 for layout rationale, storage
 // model, and the state machine consumers observe.
@@ -151,6 +151,46 @@ module AuditRecord = structure {
   //     an aligned array rather than a byte blob. --------------------
   pub let mut audit_payload_scratch : [u64; 8] = uninit @align(8)
   pub let mut audit_hdr_scratch     : u64      = uninit @align(8)
+
+  // audit_rearm() — ENH-004 (post-1.0.0). Clears the per-audit
+  // CONTENT slots that a previous audit's audit_record_output /
+  // audit_commit may have populated — record_exit_code,
+  // record_output_schema_ptr, record_output_hash — WITHOUT touching
+  // audit_id_next, audit_broker_slot, or audit_broker_failed (those
+  // are process-scoped bookkeeping, not per-audit content; clearing
+  // audit_broker_failed here would be the separate ENH-008 recovery-
+  // policy decision, not this fix). record_parent_audit_id is
+  // deliberately left untouched too: AuditClient::audit_set_parent
+  // writes it BEFORE audit_begin while state is still IDLE, and
+  // audit_begin calls audit_rearm as its first action after the IDLE
+  // gate passes — clearing parent_audit_id here would erase what
+  // audit_set_parent just wrote.
+  //
+  // Bug this fixes: audit_begin only ever wrote record_audit_id /
+  // record_op_name_ptr / record_op_args_ptr / record_state — never
+  // record_exit_code / record_output_schema_ptr / record_output_hash.
+  // A second audit in one long-lived process (the shell being the
+  // motivating case) therefore emitted an INVOKE payload carrying the
+  // FIRST audit's exit code / schema pointer / output hash at payload
+  // indices [2], [5], [6]. audit_begin now calls audit_rearm
+  // immediately after its IDLE gate passes, making every audit start
+  // from a clean per-audit-content baseline automatically — no new
+  // caller discipline required. Also exported standalone so a
+  // supervisor loop (e.g. a future shell per-command harness) can
+  // call it explicitly for symmetry with reset() if it ever needs to
+  // re-arm without going through audit_begin.
+  pub let audit_rearm : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.ENH-004: audit_rearm entry point. Zeroes exactly the three per-audit CONTENT slots a prior audit_record_output/audit_commit may have populated — record_exit_code, record_output_schema_ptr, record_output_hash — via the same `lea r11,[rip+sym]; mov [r11],rax` pattern reset() uses, with rax pre-zeroed once via xor. Deliberately does NOT touch audit_id_next (must stay monotonic across audits — the entire point of not calling full reset()), audit_broker_slot (the bind cache stays valid across audits in one process), audit_broker_failed (ENH-008 owns the sticky-flag recovery policy separately), or record_parent_audit_id (audit_set_parent writes it before audit_begin while IDLE; audit_begin calls audit_rearm right after its own IDLE gate, so clearing parent here would erase what audit_set_parent just wrote for THIS audit). record_audit_id / record_op_name_ptr / record_op_args_ptr / record_state are also left alone — audit_begin overwrites all four unconditionally on the lines immediately following its call to audit_rearm, so clearing them here would be redundant. Pure leaf — no callee-save touched, no push/pop. Register plan: rax = zero value (xor'd once, reused for all three stores), r11 = LEA scratch. Effects `!{mem} @{}` — pure .bss write, no syscall, no cap. No test mnemonic; no compare in this function at all.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + record_exit_code];         mov [r11], rax;
+        lea r11, [rip + record_output_schema_ptr]; mov [r11], rax;
+        lea r11, [rip + record_output_hash];       mov [r11], rax;
+        ret;
+      }
+    }
 
   // reset() — bootstrap init. Clears the in-progress record and
   // primes audit_id_next / audit_broker_slot to their sentinel values.

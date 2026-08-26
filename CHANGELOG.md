@@ -27,6 +27,16 @@ at the next formal release cut.
   `AUDIT_ERR_SEND_FAILED`) after a 0 return, without changing
   `audit_begin`'s wire-stable return convention. README + pdxdoc now
   carry an explicit caution against the negative-errno idiom here.
+- **ENH-004** new `AuditRecord::audit_rearm()`, called automatically
+  from `audit_begin` right after its IDLE gate passes. Fixes a
+  second audit in one long-lived process (the shell's per-command
+  loop is the motivating case) inheriting the FIRST audit's stale
+  `record_exit_code` / `record_output_schema_ptr` / `record_output_
+  hash` into its own INVOKE payload — `audit_begin` only ever
+  overwrote `record_audit_id` / `record_op_name_ptr` /
+  `record_op_args_ptr` / `record_state`. `audit_id_next`,
+  `audit_broker_slot`, `audit_broker_failed`, and
+  `record_parent_audit_id` are deliberately left untouched.
 
 ## v1.0.0 — 2026-08-22 (R49 wave close, M5-001)
 
