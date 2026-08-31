@@ -27,11 +27,12 @@ Both landed at M4.
   into the .bss slot marshal reads, and (ENH-004) the audit_rearm
   selective-clear contract. Returns 0 on pass or a 1..9 subtest
   ordinal on failure. Pure leaf (effects `!{mem} @{}`).
-- `goldens/trace_001.md` — the M4-002 wire-bytes fixture (64-byte
-  payload + header layout, per INVOKE / OUTPUT / EXIT lifecycle
-  send). Documents the byte-for-byte contract the QEMU harness
-  compares `AuditRecord::audit_payload_scratch` against once a
-  runnable consumer tool hosts the driver.
+- `goldens/trace_001.md` — the M4-002 wire-bytes fixture
+  (`PdxAuditRecord@0.2`, post-1.0.0 issues `#11` + `#12`: 256-byte
+  hybrid payload + header layout, per INVOKE / OUTPUT / EXIT
+  lifecycle send). Documents the byte-for-byte contract the QEMU
+  harness compares `AuditRecord::audit_payload_scratch` against once
+  a runnable consumer tool hosts the driver.
 
 ## Return-code convention
 
@@ -103,15 +104,18 @@ Once those three are in place, the smoke matrix runs:
 3. Consumer runs `TestReplayGolden::run()`; if != 0, exit that
    ordinal (library-observable invariants failed before wire test).
 4. Consumer runs the canonical trace from `goldens/trace_001.md`.
-5. Observer captures three 64-byte payloads (INVOKE / OUTPUT /
+5. Observer captures three 256-byte payloads (INVOKE / OUTPUT /
    EXIT).
 6. Assertions (memcmp per section of `trace_001.md`):
-   - Header word matches `AUDIT_HDR_WORD = 0x0000004000000120`.
-   - Payload [1] transitions `130 → 132 → 133` across the three
-     sends and no other order.
-   - Payload [7] is `0x000000000000002a` on all three sends (the
-     parent linkage from `audit_set_parent` — the M3-002 contract).
-   - Every other slot matches the per-section table.
+   - Header word matches `AUDIT_HDR_WORD = 0x0000010000000220`.
+   - Payload offset 8 (`event_kind`) transitions `130 → 132 → 133`
+     across the three sends and no other order.
+   - Payload offset 24 (`parent_audit_id`) is
+     `0x000000030000002a` on all three sends (the parent linkage
+     from `audit_set_parent` — the M3-002 contract, composed per
+     `#12`).
+   - Every other field matches the per-section table, including the
+     three inline string fields decoded as text (`#11`).
 
 ## What did not land in M4 (deferred to later waves)
 

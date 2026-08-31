@@ -50,7 +50,8 @@ child tools' records via `audit_id`.
 
 ## 2. AuditRecord shape
 
-Bootstrap-scope layout (M1). All slots are 8-byte aligned; the record
+Bootstrap-scope layout (M1, wire shape superseded by @0.2 — see §12.6
+for the current wire format). All slots are 8-byte aligned; the record
 holds one in-progress audit at a time. Sized to hold the fields needed
 for the M1 wire format (56 bytes of payload).
 
@@ -73,9 +74,11 @@ which mutates argv in place on `--foo=bar`. The consumer must keep the
 argv-backing pages alive from `audit_begin` through `audit_commit`; the
 lifetimes match a single tool invocation, so this is the default.
 
-The wire format sent by every lifecycle send is a fixed 64-byte
-payload of eight u64 words (grew from 56 → 64 at M3-002 to carry
-`parent_audit_id` at index [7]):
+**This wire shape (M3-002, 64 bytes / eight u64 words) is superseded by
+the @0.2 hybrid record — see §12.6 for the current, authoritative wire
+format.** It is kept here for historical context: at M3-002 every
+lifecycle send was a fixed 64-byte payload of eight u64 words (grew
+from 56 → 64 at M3-002 to carry `parent_audit_id` at index [7]):
 
 ```
 u64 audit_id              // record_audit_id                     [0]
@@ -88,18 +91,19 @@ u64 output_hash           // record_output_hash                  [6]
 u64 parent_audit_id       // record_parent_audit_id (M3-002)     [7]
 ```
 
-The IPC hdr uses the packed layout from `src/kernel/core/ipc/frame.pdx`
-in paideia-os: op = 0x20 (AUDIT_EVENT), ver = 1, reply_endpoint_id = 0
-(fire-and-forget), payload_len = 64. As a u64 constant this is
-`0x0000_0040_0000_0120` (M3-002; was `0x0000_0038_0000_0120` at
-M2 when payload_len was 56). M2-001 refines op / ver as the schema
-evolves to match `UEJ_KIND_TOOL_INSTALL/REMOVE/INVOKE/ERROR`
-(constants at `src/kernel/core/ipc/audit_journal_broker.pdx` in
-paideia-os, 128..131). The kernel-side broker dispatch is still
-stubbed (`audit_journal_broker_dispatch` returns `AJB_DISPATCH_STUB`)
-so `sys_ipc_send` only enforces `payload_len ≤ PENDING_PAYLOAD_MAX_BYTES`,
-well above 64 — the schema grow is safe until the daemon body lands
-with a fixed schema at R49-PREP-007.
+The M3-002 IPC hdr used the packed layout from
+`src/kernel/core/ipc/frame.pdx` in paideia-os: op = 0x20 (AUDIT_EVENT),
+ver = 1, reply_endpoint_id = 0 (fire-and-forget), payload_len = 64. As
+a u64 constant this was `0x0000_0040_0000_0120` (was
+`0x0000_0038_0000_0120` at M2 when payload_len was 56). This shape had
+two defects, fixed together at @0.2 (§12.6): (libpdx-audit#11)
+`op_name_ptr` / `op_args_ptr` / `output_schema_ptr` at indices [3]/[4]/
+[5] were live VAs in the SENDING process — meaningless integers to any
+reader in a different address space, such as the audit-journal daemon
+— and (libpdx-audit#12) `audit_id` at index [0] was a bare per-process
+monotonic counter, so every tool's first audit had `audit_id == 1`,
+breaking the M3-002 parent-linkage feature the moment two sibling
+processes each opened their first audit.
 
 ## 3. Storage model
 
@@ -563,6 +567,205 @@ cap consumption, no push/pop. Label prefix `asp_` per the
 paideia-as reserved-label discipline (bare `ok` / `fail` collide
 with keywords; `asp_ok` / `asp_bad_state` are unique).
 
+## 12.6 @0.2 — coordinated wire revision (libpdx-audit#11 + #12)
+
+Two independent post-1.0.0 bugs against the M3-002 wire format were
+shipped together as one `PdxAuditRecord@0.1 → @0.2` revision, because
+fixing either alone would have required a second, separate
+`AUDIT_HDR_WORD` / `AUDIT_PAYLOAD_BYTES` bump within the same release
+window:
+
+- **#11 (sender-local pointers don't cross the process boundary).**
+  Payload words `[3] op_name_ptr`, `[4] op_args_ptr`,
+  `[5] output_schema_ptr` were live VAs in the sending process.
+  `sys_ipc_send` bounces exactly `payload_len` bytes and does not
+  follow pointers, so the audit-journal daemon received opaque
+  integers where readable text belonged.
+- **#12 (`audit_id` not globally unique).** `AuditRecord::reset`
+  seeded `audit_id_next = 1` per process, so every tool's first audit
+  was `audit_id == 1`. The M3-002 parent-linkage feature (a child
+  writes its parent's `audit_id` into `parent_audit_id`) is unusable
+  in a shell running many children — `parent_audit_id = 1` names the
+  first audit of every process that ever ran, not one specific parent.
+
+### 12.6.1 #11 — inlining strategy: fixed-size inline arrays (Option A)
+
+Three options were on the table:
+
+- **Option A — fixed-size inline arrays.** Grow the payload to a
+  larger fixed size with inline char arrays at fixed offsets. Simple;
+  wastes bytes on short records.
+- **Option B — length-prefixed variable tail.** Keep a small fixed
+  header, then a length + concatenated string blob. More space-
+  efficient; requires the broker-side decoder to walk a variable
+  layout, and requires this library to compute and write a total
+  length up front (a second pass over the same three strings, or a
+  running-total accumulator threaded through three marshal calls).
+- **Option C — cap-transferred string region.** Sender mints a
+  `KIND_MEMORY` region containing the strings, passes the cap slot in
+  the payload; broker resolves it via the cap table. Most correct for
+  arbitrarily long strings, but requires kernel-side support (a fresh
+  cap grant per audit, and a broker-side `cap_invoke`/map path) that
+  does not exist yet, and adds a per-audit cap-table allocation this
+  library has otherwise avoided since M1 ("zero heap dependency ...
+  every buffer is a static array", §3).
+
+**Chosen: Option A**, with 32/128/32-byte fields for
+op_name/op_args/output_schema, for 256 bytes total. Rationale:
+
+- Every real consumer's `op_name` is a tool basename (`ls`, `rm`,
+  `cp`, `pkg`) — comfortably under 32 bytes. `op_args` is the
+  free-form argv tail; 128 bytes covers any realistic single-tool
+  invocation this org's shell wave currently supports, and a longer
+  invocation degrades gracefully to a truncated-but-still-readable
+  and still-NUL-terminated record rather than a decode failure.
+  `output_schema` names are declared schema identifiers like
+  `PdxFsDirEntry@0.1` (18 bytes) — 32 bytes has headroom to spare.
+- A fixed 256-byte record is still cheap: `sys_ipc_send`'s only
+  documented limit is `payload_len ≤ PENDING_PAYLOAD_MAX_BYTES`, well
+  above 256, and the kernel-side broker dispatch is still stubbed
+  (`AJB_DISPATCH_STUB`), so there is no daemon-side buffer-pool
+  pressure to weigh against the 4x payload growth.
+  Option B's per-message space efficiency is not worth its added
+  encoding complexity (a length prefix this library must compute
+  correctly across three variable-length copies) at this milestone;
+  Option C's correctness ceiling (true arbitrary-length strings via a
+  transferred capability) is not worth introducing a new per-audit
+  kernel-mediated resource when the static-buffer M1 constraint
+  ("zero heap dependency") already rules out anything that isn't a
+  fixed .bss region.
+- Fixed-size inline arrays keep `AuditBroker::audit_marshal_string`
+  (src/audit_broker.pdx) a single, reusable, allocation-free leaf
+  helper called three times with different offsets/widths — no
+  running-total bookkeeping, no partial-record failure mode.
+
+If a future consumer needs longer `op_args` (e.g. a shell command with
+many long flags), the fix is a wider `AUDIT_OP_ARGS_BYTES` constant and
+another coordinated `@0.2 → @0.3` bump — not a redesign of the
+strategy.
+
+### 12.6.2 #12 — uniqueness strategy: `(pid, local_id)` tuple (Option B)
+
+Three options were on the table:
+
+- **Option A — kernel-supplied unique ID via a new syscall.** Adds
+  kernel surface (a new `sys_get_audit_id` handler) for a problem this
+  library can already solve with an existing primitive.
+- **Option B — `(pid, local_id)` tuple.** `sys_getpid` (SC+ ID 39)
+  already exists in paideia-os (`design/kernel/r17-m1-001-syscall-shim.md`,
+  `src/kernel/core/syscall/dispatch.pdx`'s `dispatch_getpid`) and is a
+  pure, zero-argument, no-capability read of `_current_tcb`'s pid
+  field (`!{sysreg} @{}`). Composing the wire `audit_id` as
+  `(pid << 32) | local_id` needs zero kernel change.
+- **Option C — daemon-side rewrite at receipt.** The broker allocates
+  a monotonic global ID on receipt and sends it back to the client.
+  Requires a round-trip (this library's sends are fire-and-forget,
+  `reply_endpoint_id = 0` — adding a reply path is a bigger protocol
+  change than the record shape itself) and moves the uniqueness
+  authority to a daemon that, per §13.3, does not have a body yet.
+
+**Chosen: Option B.** `AuditClient::audit_begin` (src/audit_client.pdx)
+lazily fetches the caller's pid via `sys_getpid` on its first
+invocation in a process, caches it in the new `AuditRecord::
+audit_process_pid` .bss slot (0 = not-yet-fetched; a real pid is never
+0 — paideia-os's process allocator is 1-based, see
+`src/kernel/core/process/process.pdx`), and composes the wire
+`audit_id` as:
+
+```
+audit_id = (pid << 32) | local_id
+```
+
+where `local_id` is exactly the @0.1 `audit_id_next` allocation
+(unchanged — still a per-process monotonic counter starting at 1).
+`sys_getpid`'s effects (`{sysreg}`, `{}` capabilities) are already
+fully subsumed by `audit_begin`'s existing widened effect tail
+(`!{mem, sysreg} @{cap, sched}`, from M2-001's IPC send), so **no
+effect-signature or `caps.decl` change was needed for #12** — the only
+kernel-surface touched is a new userspace trampoline for an
+already-existing syscall (`sys_getpid` added to
+`src/syscall_shim.pdx`).
+
+**Collision analysis.** As of the current kernel,
+`src/kernel/core/process/process.pdx`'s `_next_pid` is a monotonically
+increasing 1-based counter with no free-list — pids are never reused.
+Under that behaviour, `(pid << 32) | local_id` is unique for the
+lifetime of the running kernel image, not merely unique among
+concurrently-running processes: two processes can never produce the
+same wire `audit_id`, and any `parent_audit_id` a child observes
+resolves to exactly one prior record, full stop. Should a future
+kernel revision introduce pid recycling (e.g. a free-list on process
+exit), the guarantee would degrade to "unique among audits whose
+parent process's pid has not since been reused" — the same bound
+ordinary Unix PID-based correlation accepts, and still a strict
+improvement over @0.1's "unique only within a single process, not
+even across the child's own commit". `local_id` is packed into the
+low 32 bits unmasked (no `and rax, 0xFFFFFFFF`) — a single process
+would need roughly 4.29 billion audits to overflow into the pid's
+bits, which the existing "u64 overflow is not a shipping concern" note
+in §5 covers by the same margin of implausibility, just at a smaller
+(still enormous) bound than the un-packed u64 counter had.
+
+### 12.6.3 @0.2 record layout
+
+```
+offset  width  field            source                          notes
+------  -----  ---------------  ------------------------------  --------------------------------
+     0      8  audit_id         record_audit_id                 #12: (pid << 32) | local_id
+     8      8  event_kind       argument to audit_send_record   UEJ_KIND_TOOL_INVOKE/OUTPUT/EXIT
+    16      8  exit_code        record_exit_code
+    24      8  parent_audit_id  record_parent_audit_id          0 iff top-level (unchanged, M3-002)
+    32      8  output_hash      record_output_hash
+    40     32  op_name          record_op_name_ptr (inlined)    #11: NUL-terminated, zero-padded
+    72    128  op_args          record_op_args_ptr (inlined)    #11: NUL-terminated, zero-padded
+   200     32  output_schema    record_output_schema_ptr (inl.) #11: NUL-terminated, zero-padded
+   232     24  reserved         —                                always zero; never written
+```
+
+Total: 256 bytes (`AuditRecord::AUDIT_PAYLOAD_BYTES`). Offset and width
+constants are declared in `AuditRecord` (`AUDIT_OFF_*`,
+`AUDIT_*_BYTES`) as the single source of truth
+`AuditBroker::audit_send_record`, this document, and
+`tests/goldens/trace_001.md` all cross-check against.
+
+Each inline string field is filled by the new private
+`AuditBroker::audit_marshal_string(dst_ptr, src_ptr, max_len)` helper
+(src/audit_broker.pdx): it copies up to `max_len - 1` bytes from
+`src_ptr` (stopping early at the source's own NUL), then zero-pads the
+remainder of the field — always leaving the field's last byte zero, so
+a truncated source string is still a valid NUL-terminated C string on
+the wire. `src_ptr == 0` (legal for `op_args` and for
+`output_schema` before `OUTPUT`) produces an all-zero field.
+
+The IPC frame header changes to reflect the new size and to let a
+future decoder branch on frame version:
+
+```
+AUDIT_HDR_WORD (@0.2) = 0x0000_0100_0000_0220
+```
+
+| bits    | field              | value          |
+|---------|--------------------|----------------|
+| [0..7]  | `op`               | 0x20  (AUDIT_EVENT, unchanged) |
+| [8..15] | `ver`              | 2  (bumped from 1) |
+| [16..31]| `reply_endpoint_id`| 0  (fire-and-forget, unchanged) |
+| [32..47]| `payload_len`      | 256  (0x100 — grew from 0x40) |
+| [48..63]| *reserved*         | 0              |
+
+### 12.6.4 Compatibility
+
+There is no negotiation on `svc.audit-journal` — per `caps.decl`'s
+`wire_ownership` block, libpdx-audit is the sole sanctioned producer
+implementation of this frame, and the kernel-side
+`audit_journal_broker_dispatch` stub does not yet validate payload
+shape (`AJB_DISPATCH_STUB`, §7 / §12.3). @0.2 is therefore a clean
+break, not a versioned-negotiation upgrade: every consumer that
+re-links this library gets @0.2 automatically, and there is no running
+@0.1 producer or consumer to interoperate with once the daemon body
+lands. When `R49-PREP-007`'s daemon body does land, it must decode
+`ver == 2` / `payload_len == 256` against the §12.6.3 layout, not the
+§2 M3-002 layout.
+
 ## 13. M4 — test discipline
 
 libpdx-audit is a shared library with no runnable executable of its
@@ -640,17 +843,23 @@ M4-002 protocol for that future harness in detail.
 ### 13.4 Golden fixture format
 
 `tests/goldens/trace_001.md` is the canonical M4-002 wire-bytes
-fixture. It documents:
+fixture, updated for @0.2 (libpdx-audit#11 + #12). It documents:
 
-- The header word (`AUDIT_HDR_WORD = 0x0000004000000120`) with per-
+- The header word (`AUDIT_HDR_WORD = 0x0000010000000220`) with per-
   field bit layout.
-- Three per-send payload tables (INVOKE / OUTPUT / EXIT), each
-  eight `u64` rows corresponding to `audit_payload_scratch` indices
-  [0..7].
-- Concrete values where the library owns them (audit_id,
-  event_kind, exit_code, parent_audit_id); symbolic placeholders
-  (`<LS_NAME_VA>`, `<HASH_LS>`, …) where the value depends on
-  consumer-owned memory or a runtime-computed hash.
+- Three per-send payload tables (INVOKE / OUTPUT / EXIT), each the
+  full @0.2 hybrid layout: five `u64` numeric rows at offsets
+  0/8/16/24/32 followed by the three inline string fields at offsets
+  40/72/200 (rendered as their decoded text, not raw bytes, since
+  §12.6's #11 fix is exactly that these fields ARE now readable text)
+  and the 24 reserved bytes at offset 232.
+- Concrete values where the library owns them (audit_id — now the
+  #12 composed `(pid << 32) | local_id` — event_kind, exit_code,
+  parent_audit_id); the inline string fields are rendered as their
+  literal decoded text per §12.6's #11 fix (previously symbolic VA
+  placeholders like `<LS_NAME_VA>`, since @0.1 sent raw pointers);
+  `<HASH_LS>` remains a symbolic placeholder since output_hash still
+  depends on a runtime-computed hash.
 - A companion M4-001 failure-path fixture (child exits 3, emits 0
   bytes, no wire payload).
 - A change-management section calling out what code changes require

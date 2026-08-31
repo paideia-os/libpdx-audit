@@ -70,6 +70,12 @@ allocated `audit_id` (u64 > 0) on success, or 0 on failure (state gate
 or send failure — see [[cref: ERROR-CODES]]). On success transitions
 `record_state` IDLE → BEGUN and issues an INVOKE event to the broker.
 
+Post-1.0.0 (`#12`): the returned `audit_id` is `(pid << 32) |
+local_id`, not a bare per-process counter — see [[cref: WIRE-FORMAT]].
+`audit_begin` lazily fetches the process's own pid via `sys_getpid`
+(SC+ ID 39) on its first call in a process and caches it; every
+subsequent call reuses the cached value at no extra syscall cost.
+
 CAUTION: the failure sentinel is a bare `0`, NOT negative-errno. Every
 other IPC-adjacent shim in this org signals failure with a negative
 u64 tested via `cmp rax, 0; jl fail`; `audit_begin` does not follow
@@ -151,33 +157,56 @@ HASH]]). The API surface, the `.bss` state slot, and the return type
 are stable across the swap.
 
 ==== WIRE-FORMAT
-Every lifecycle send (INVOKE at begin, OUTPUT at record_output, EXIT at
-commit) marshals a fixed 64-byte payload of eight u64 words to the
-kernel `sys_ipc_send` handler:
+Post-1.0.0, `PdxAuditRecord@0.2` (issues `#11` + `#12`, shipped as one
+coordinated wire revision; supersedes `@0.1`). Every lifecycle send
+(INVOKE at begin, OUTPUT at record_output, EXIT at commit) marshals a
+fixed 256-byte hybrid payload to the kernel `sys_ipc_send` handler:
+five u64 header words, then three fixed-size inline NUL-terminated
+string fields, then 24 reserved bytes.
 
-    [0] audit_id                        (record_audit_id)
-    [1] event_kind                      (UEJ_KIND_TOOL_INVOKE=130 |
-                                         UEJ_KIND_TOOL_OUTPUT=132 |
-                                         UEJ_KIND_TOOL_EXIT=133)
-    [2] exit_code                       (record_exit_code; 0 outside EXIT)
-    [3] op_name_ptr                     (caller-owned NUL-terminated)
-    [4] op_args_ptr                     (caller-owned NUL-terminated; 0 ok)
-    [5] output_schema_ptr               (0 outside OUTPUT+)
-    [6] output_hash                     (audit_hash_finalize return)
-    [7] parent_audit_id                 (M3-002; 0 for top-level)
+    [  0.. 8) audit_id            (record_audit_id — `#12`: (pid << 32) | local_id)
+    [  8..16) event_kind          (UEJ_KIND_TOOL_INVOKE=130 |
+                                   UEJ_KIND_TOOL_OUTPUT=132 |
+                                   UEJ_KIND_TOOL_EXIT=133)
+    [ 16..24) exit_code           (record_exit_code; 0 outside EXIT)
+    [ 24..32) parent_audit_id     (M3-002; 0 for top-level; opaque
+                                   composed id, unaffected by #12's
+                                   packing of THIS process's own id)
+    [ 32..40) output_hash         (audit_hash_finalize return)
+    [ 40..72) op_name             (32-byte inline string; `#11`)
+    [ 72..200) op_args            (128-byte inline string; `#11`)
+    [200..232) output_schema      (32-byte inline string; `#11`)
+    [232..256) reserved           (always zero; never written)
 
-The IPC header word is `0x0000_0040_0000_0120` — op = 0x20
-(AUDIT_EVENT), ver = 1, reply_endpoint_id = 0 (fire-and-forget),
-payload_len = 64. Grew from 56 bytes at M2 to 64 at M3-002 when
-`parent_audit_id` landed at index [7].
+The IPC header word is `0x0000_0100_0000_0220` — op = 0x20
+(AUDIT_EVENT), ver = 2 (bumped from 1 at `@0.2`),
+reply_endpoint_id = 0 (fire-and-forget), payload_len = 256 (grew from
+64 at `@0.2`; was 56 at M2, 64 from M3-002 through v1.0.0).
 
-Pointer indices ([3], [4], [5]) reference caller-owned memory. The
-consumer MUST keep those pages alive from `audit_begin` through
-`audit_commit`; the lifetimes match a single tool invocation.
+Through v1.0.0, `op_name_ptr` / `op_args_ptr` / `output_schema_ptr`
+were live pointers into caller-owned memory, meaningless outside the
+sending process. `#11` fixes this: `audit_send_record` now copies the
+string BYTES themselves into the three inline fields above via the
+private `AuditBroker::audit_marshal_string` helper — up to
+(field_width - 1) source bytes, stopping early at the source's own
+NUL, then zero-padded (the field's last byte is always zero, so a
+truncated string is still NUL-terminated). A `0` source pointer
+(legal for `op_args` before it is set, or `output_schema` before
+OUTPUT) yields an all-zero field.
+
+`#12` fixes `audit_id` uniqueness: through v1.0.0 it was a bare
+per-process monotonic counter, so every tool's first audit had
+`audit_id == 1`, and a `parent_audit_id` of `1` could name ANY
+process's first audit. `audit_begin` now composes it as
+`(pid << 32) | local_id`, using `sys_getpid` (SC+ ID 39) — already an
+existing paideia-os syscall, so `#12` required no new kernel surface,
+only a new userspace trampoline in `src/syscall_shim.pdx`.
 
 The byte-for-byte fixture at `tests/goldens/trace_001.md` documents the
-canonical `/bin/ls --long /home` audit trace as a shell child (parent_
-audit_id = 0x2a).
+canonical `/bin/ls --long /home` audit trace as a shell child (shell
+pid 3, local counter 0x2a, so parent_audit_id =
+0x000000030000002a; child pid 7, its own first audit, so
+audit_id = 0x0000000700000001).
 
 ==== STATE-MACHINE
 `record_state` transitions:
@@ -252,7 +281,8 @@ exhausted or hard-failed). Both slots are zeroed together, only by
 ==== PARENT-LINKAGE
 The parent-child linkage between a shell's `ShellCommandRecord` and its
 spawned child tools travels through the `parent_audit_id` slot at
-payload index [7]. The shell binds its command-record's audit_id via
+payload offset 24 (offset 56 through v1.0.0, before the `@0.2` grow —
+see [[cref: WIRE-FORMAT]]). The shell binds its command-record's audit_id via
 `audit_set_parent(shell_cmd_id)` in the child's process image before
 _start, and the child's every INVOKE/OUTPUT/EXIT send carries that id.
 A top-level audit (a login shell, or a tool spawned outside a shell)
@@ -323,4 +353,7 @@ this repo. Wire-bytes fixture: `tests/goldens/trace_001.md`. Test
 protocol: `tests/README.md`.
 
 ==== VERSION
-libpdx-audit 1.0.0 (R49 wave, M5-001 signed release).
+libpdx-audit 1.0.0 (R49 wave, M5-001 signed release). Post-1.0.0,
+issues `#11` + `#12` land the `PdxAuditRecord@0.2` coordinated wire
+revision documented in [[cref: WIRE-FORMAT]] above; a version bump +
+CHANGELOG rollup happens at the next formal release cut.

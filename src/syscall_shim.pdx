@@ -1,8 +1,10 @@
-// src/syscall_shim.pdx — libpdx-audit.M1-002
+// src/syscall_shim.pdx — libpdx-audit.M1-002 + libpdx-audit#12
 // Minimal syscall trampolines libpdx-audit needs to bind the
-// svc.audit-journal broker and emit a committed audit record.
+// svc.audit-journal broker, emit a committed audit record, and (as of
+// #12) resolve the caller's own pid for the @0.2 globally-unique
+// audit_id composition.
 //
-// Two wrappers, both drawn from paideia-os's SC+ table
+// Three wrappers, all drawn from paideia-os's SC+ table
 // (design/kernel/r17-m1-001-syscall-shim.md):
 //
 //   sys_svc_lookup   SC+ ID 43 — resolves a broker name to a fresh
@@ -10,6 +12,11 @@
 //                                 caller's cap_table.
 //   sys_ipc_send     SC+ ID 42 — non-blocking send on an IPC endpoint
 //                                 using a previously-resolved cap slot.
+//   sys_getpid       SC+ ID 39 — returns the calling process's pid.
+//                                 Used by AuditClient::audit_begin
+//                                 (src/audit_client.pdx) to seed
+//                                 AuditRecord::audit_process_pid once
+//                                 per process (libpdx-audit#12).
 //
 // ABI: SysV on entry (rdi/rsi/rdx/rcx/r8/r9) -> SYSCALL on syscall
 // (rdi/rsi/rdx/r10/r8/r9). Both wrappers here are arity ≤ 3 so no
@@ -62,6 +69,26 @@ module SyscallShim = structure {
       block: {
         mov r10, rcx;
         mov rax, 42;
+        syscall;
+        ret;
+      }
+    }
+
+  // sys_getpid() -> u64
+  //   rax = current process id. Never 0 for a running process —
+  //         paideia-os's process allocator (src/kernel/core/process/
+  //         process.pdx `_next_pid`) is 1-based and (as of the current
+  //         kernel) never recycles a pid, so 0 is a safe permanent
+  //         "not yet fetched" sentinel for AuditRecord::
+  //         audit_process_pid (libpdx-audit#12).
+  //
+  // Arity 0 — no SysV -> SYSCALL register shuffle needed.
+  pub let sys_getpid : () -> u64 !{sysreg} @{} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-audit#12: SC+ ID 39 trampoline (sys_getpid). Zero-arg syscall — no SysV -> SYSCALL register shuffle needed (arity 0 < 4, same template class as sys_svc_lookup/sys_ipc_send). Effects match the kernel handler (design/kernel/r17-m1-001-syscall-shim.md lists sys_getpid as `!{sysreg} @{}` — an inline read of _current_tcb's TASK_OFF_PID field, no user-memory walk, no cap consumption; src/kernel/core/syscall/dispatch.pdx's dispatch_getpid confirms the same shape). AuditClient::audit_begin (src/audit_client.pdx) calls this at most once per process, lazily, caching the result in AuditRecord::audit_process_pid. Leaf trampoline; no callee-save touched, no push/pop.",
+      block: {
+        mov rax, 39;
         syscall;
         ret;
       }

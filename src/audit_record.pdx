@@ -25,16 +25,54 @@ module AuditRecord = structure {
   pub let AUDIT_BROKER_SLOT_UNRESOLVED : u64 = 0xFFFF
 
   // --- Wire format sizes (see design/architecture.md §2). --------------
-  // M3-002 upgrade: payload grows from 56 to 64 bytes (seven → eight
-  // u64 words) to carry record_parent_audit_id at payload index [7].
-  // AUDIT_HDR_WORD's payload_len field (top 16 bits of the low half,
-  // little-endian: bits [16..31] of the low 32) moves 0x38 → 0x40 to
-  // match. The kernel-side audit_journal_broker_dispatch stub
-  // (paideia-os src/kernel/core/ipc/audit_journal_broker.pdx) returns
+  // @0.2 upgrade (libpdx-audit#11 + #12, shipped as one coordinated
+  // wire revision): payload grows from the M3-002 64-byte / eight-u64-
+  // word record to a 256-byte hybrid record — five u64 numeric words
+  // (audit_id, event_kind, exit_code, parent_audit_id, output_hash)
+  // followed by three fixed-size inline NUL-terminated string fields
+  // (op_name[32], op_args[128], output_schema[32]) and 24 reserved
+  // bytes. #11 fix: @0.1 sent record_op_name_ptr / record_op_args_ptr
+  // / record_output_schema_ptr verbatim — live VAs meaningful only in
+  // the SENDING process's address space; the broker (a different
+  // process) received opaque integers where readable text belonged.
+  // AuditBroker::audit_marshal_string (src/audit_broker.pdx) now
+  // copies the bytes themselves at send time. #12 fix: record_audit_id
+  // is no longer a bare per-process monotonic counter — see
+  // AuditClient::audit_begin's composition of (pid << 32) | local_id,
+  // which makes every audit_id (and therefore every parent_audit_id
+  // observed downstream) globally unique across processes, not merely
+  // unique within one. AUDIT_HDR_WORD's payload_len field (bits
+  // [32..47]) moves 0x40 → 0x100 (256) and `ver` (bits [8..15]) bumps
+  // 1 → 2 so a future decoder can branch on frame version. The
+  // kernel-side audit_journal_broker_dispatch stub (paideia-os
+  // src/kernel/core/ipc/audit_journal_broker.pdx) returns
   // AJB_DISPATCH_STUB without validating the payload shape, so the
   // grow is safe until the daemon body lands with a fixed schema.
-  pub let AUDIT_PAYLOAD_BYTES : u64 = 64   // eight u64 words (M3-002)
-  pub let AUDIT_HDR_WORD      : u64 = 0x0000004000000120  // op=0x20 | ver=1 | reply_ep=0 | payload_len=64
+  pub let AUDIT_PAYLOAD_BYTES : u64 = 256  // @0.2 hybrid record (libpdx-audit#11 + #12)
+  pub let AUDIT_HDR_WORD      : u64 = 0x0000010000000220  // op=0x20 | ver=2 | reply_ep=0 | payload_len=256
+
+  // --- @0.2 inline-string field widths + byte offsets. Every offset is
+  //     absolute within audit_payload_scratch; AuditBroker::
+  //     audit_send_record uses these directly (kept here, alongside
+  //     AUDIT_PAYLOAD_BYTES, as the single source of truth the golden
+  //     fixture and any future decoder cross-check against). Each
+  //     WIDTH constant includes the mandatory NUL terminator byte —
+  //     AuditBroker::audit_marshal_string copies at most (WIDTH - 1)
+  //     source bytes and always leaves the final byte of the field 0.
+  pub let AUDIT_OFF_AUDIT_ID        : u64 = 0
+  pub let AUDIT_OFF_EVENT_KIND      : u64 = 8
+  pub let AUDIT_OFF_EXIT_CODE       : u64 = 16
+  pub let AUDIT_OFF_PARENT_ID       : u64 = 24
+  pub let AUDIT_OFF_OUTPUT_HASH     : u64 = 32
+  pub let AUDIT_OFF_OP_NAME         : u64 = 40
+  pub let AUDIT_OFF_OP_ARGS         : u64 = 72
+  pub let AUDIT_OFF_OUTPUT_SCHEMA   : u64 = 200
+  pub let AUDIT_OFF_RESERVED        : u64 = 232
+
+  pub let AUDIT_OP_NAME_BYTES       : u64 = 32
+  pub let AUDIT_OP_ARGS_BYTES       : u64 = 128
+  pub let AUDIT_OUTPUT_SCHEMA_BYTES : u64 = 32
+  pub let AUDIT_RESERVED_BYTES      : u64 = 24
 
   // --- M3-001 FNV-1a-64 hash constants. Placeholder for the
   //     BLAKE3-truncated hash design/tooling/r49-r50-plan.md §5.13
@@ -104,6 +142,23 @@ module AuditRecord = structure {
   // get parent = 0 in their wire records.
   pub let mut record_parent_audit_id   : u64 = uninit @align(8)
 
+  // #12 process-identity cache. 0 means "not yet fetched" — a real pid
+  // is never 0 (paideia-os's process allocator at
+  // src/kernel/core/process/process.pdx is 1-based; the first process
+  // in the system gets pid 1). AuditClient::audit_begin lazily fetches
+  // this via sys_getpid (SC+ ID 39) on its first call in a process and
+  // caches it here permanently — a pid cannot change for the lifetime
+  // of the process it names, so unlike audit_broker_slot (whose cache
+  // reset() deliberately invalidates) this slot is NEVER cleared by
+  // reset(), even on a defensive re-init call; re-fetching would only
+  // ever return the same value at the cost of a redundant syscall.
+  // audit_begin composes the wire audit_id as (pid << 32) | local_id
+  // using this slot's value, which is what makes audit_id (and every
+  // parent_audit_id derived from it) globally unique across processes
+  // rather than merely unique within one — see design/architecture.md
+  // §12.6 and AuditRecord::AUDIT_PAYLOAD_BYTES's @0.2 comment above.
+  pub let mut audit_process_pid        : u64 = uninit @align(8)
+
   // M2-002 sticky failure flag. Written to 1 the first time any send
   // path (audit_begin's INVOKE, audit_record_output's OUTPUT, or
   // audit_commit's EXIT) fails; consumers read it via
@@ -160,13 +215,20 @@ module AuditRecord = structure {
   pub let mut record_hash_state        : u64 = uninit @align(8)
   pub let mut record_hash_active       : u64 = uninit @align(8)
 
-  // --- Send-time payload scratch. `.bss` again; 64 bytes = one wire
-  //     record at M3-002 (grew from 56 to 64 to carry parent_audit_id
-  //     at index [7]). audit_send_record memcpy-fills this before
-  //     sys_ipc_send. Sized in u64 words so paideia-as encodes it as
-  //     an aligned array rather than a byte blob. --------------------
-  pub let mut audit_payload_scratch : [u64; 8] = uninit @align(8)
-  pub let mut audit_hdr_scratch     : u64      = uninit @align(8)
+  // --- Send-time payload scratch. `.bss` again; 256 bytes = one @0.2
+  //     wire record (grew from the M3-002 64-byte / eight-u64-word
+  //     shape — see AUDIT_PAYLOAD_BYTES's comment above for the full
+  //     libpdx-audit#11 + #12 rationale). AuditBroker::audit_send_
+  //     record byte-fills this before every sys_ipc_send: the five
+  //     numeric header words via plain `mov [r11+off], reg` (any
+  //     8-byte-aligned offset is a legal store target regardless of
+  //     the array's declared element type), the three inline string
+  //     fields via AuditBroker::audit_marshal_string's byte-at-a-time
+  //     copy. Declared `[u8; 256]` (byte array, not `[u64; N]`) since
+  //     @0.2 is no longer a uniform array of u64 words — @align(8)
+  //     keeps the numeric-word stores aligned exactly as before. -----
+  pub let mut audit_payload_scratch : [u8; 256] = uninit @align(8)
+  pub let mut audit_hdr_scratch     : u64       = uninit @align(8)
 
   // audit_rearm() — ENH-004 (post-1.0.0). Clears the per-audit
   // CONTENT slots that a previous audit's audit_record_output /
@@ -213,6 +275,15 @@ module AuditRecord = structure {
   // Consumers call this ONCE at process start (typical: right after
   // libpdx-argv's ParsedArgs::reset() at _start), not between audits —
   // audit_id_next must remain monotonic across audits within a process.
+  //
+  // #12: deliberately does NOT zero audit_process_pid. Every other
+  // process-scoped cache reset() re-arms to a "must re-resolve" state
+  // (audit_broker_slot -> UNRESOLVED) because the underlying value CAN
+  // legitimately change across a defensive re-init (e.g. cap-table
+  // churn). A process's own pid cannot change for its lifetime, so
+  // re-fetching after a defensive reset() would return the identical
+  // value at the cost of a redundant sys_getpid syscall — leaving the
+  // cache populated is strictly better, not merely equivalent.
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},

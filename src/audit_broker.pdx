@@ -1,25 +1,26 @@
-// src/audit_broker.pdx — libpdx-audit.M1-002 + M2-001 + M2-002 + M2-003 + M3-002 + ENH-008
+// src/audit_broker.pdx — libpdx-audit.M1-002 + M2-001 + M2-002 + M2-003 + M3-002 + ENH-008 + #11
 // AuditBroker: svc.audit-journal binding + audit-record marshalling +
-// sys_ipc_send delivery. Two entry points:
+// sys_ipc_send delivery. Two public entry points plus one private
+// marshalling helper:
 //
 //   audit_broker_bind()               -> AUDIT_OK | AUDIT_ERR_BROKER_UNAVAILABLE
 //   audit_send_record(event_kind)     -> AUDIT_OK | AUDIT_ERR_BROKER_UNAVAILABLE
 //                                      | AUDIT_ERR_SEND_FAILED
+//   audit_marshal_string(dst, src, max_len) -> ()   [private, #11]
 //
 // audit_broker_bind resolves the well-known service name via
 // sys_svc_lookup (SC+ ID 43) and caches the returned cap slot in
 // AuditRecord::audit_broker_slot. Idempotent: subsequent calls fast-
 // return when the cached slot is already valid.
 //
-// audit_send_record (M2-001) marshals the seven-u64 payload from the
-// AuditRecord singleton into audit_payload_scratch — writing the
-// caller-supplied event_kind at payload index [1] — writes the packed-
-// u64 IPC header into audit_hdr_scratch, then invokes sys_ipc_send
-// (SC+ ID 42). Replaces the M1-002 monolithic audit_send_committed_
-// record which always wrote UEJ_KIND_TOOL_INVOKE at [1]. The three
-// lifecycle callsites in AuditClient now pass UEJ_KIND_TOOL_INVOKE
-// (from audit_begin), UEJ_KIND_TOOL_OUTPUT (from audit_record_output),
-// and UEJ_KIND_TOOL_EXIT (from audit_commit) so a supervisor can
+// audit_send_record (M2-001) marshals the @0.2 hybrid payload (#11 +
+// #12, see design/architecture.md §12.6) from the AuditRecord
+// singleton into audit_payload_scratch — writing the caller-supplied
+// event_kind at offset 8 — writes the packed-u64 IPC header into
+// audit_hdr_scratch, then invokes sys_ipc_send (SC+ ID 42). The three
+// lifecycle callsites in AuditClient pass UEJ_KIND_TOOL_INVOKE (from
+// audit_begin), UEJ_KIND_TOOL_OUTPUT (from audit_record_output), and
+// UEJ_KIND_TOOL_EXIT (from audit_commit) so a supervisor can
 // discriminate the phases of a single audit. M2-002 wired the sticky
 // audit_broker_failed flag into both failure epilogues so the
 // consumer's audit_can_emit_output() guard refuses output on any
@@ -27,8 +28,17 @@
 // EAGAIN loop (up to 3 retries with 4096-cycle spin backoff between
 // attempts); non-EAGAIN errors still hard-fail immediately.
 //
+// #11 fix: @0.1 wrote record_op_name_ptr / record_op_args_ptr /
+// record_output_schema_ptr verbatim into the wire payload — live VAs
+// meaningful only inside the SENDING process. audit_send_record now
+// calls the new private audit_marshal_string helper three times to
+// copy the actual string BYTES (from the sender's own address space,
+// where the dereference is always valid) into three fixed-size inline
+// fields, so a broker-side reader with no access to the sender's
+// address space can render op_name / op_args / output_schema as text.
+//
 // See design/architecture.md §5 (audit_id allocation), §6 (broker
-// binding), §7 (send failure discipline), §2 (wire format).
+// binding), §7 (send failure discipline), §2 + §12.6 (wire format).
 // Upstream: design/tooling/r49-r50-plan.md §3.4 + §5.13 (paideia-os).
 //
 // Cross-module symbols read/written (all in AuditRecord .bss):
@@ -41,6 +51,8 @@
 // Cross-module functions called:
 //   sys_svc_lookup   (src/syscall_shim.pdx)
 //   sys_ipc_send     (src/syscall_shim.pdx)
+// In-module functions called:
+//   audit_marshal_string (private, #11 — see below)
 
 module AuditBroker = structure {
 
@@ -125,36 +137,48 @@ module AuditBroker = structure {
   // hard-coded UEJ_KIND_TOOL_INVOKE at [1]). Called from all three
   // AuditClient lifecycle entry points — audit_begin passes INVOKE,
   // audit_record_output passes OUTPUT, audit_commit passes EXIT. The
-  // wire format grew from 56 → 64 bytes at M3-002 to carry
-  // record_parent_audit_id at index [7]; only the event_kind
+  // wire format grew from the M3-002 64-byte / eight-u64-word shape to
+  // the @0.2 256-byte hybrid record (#11 + #12); only the event_kind
   // discriminator varies per lifecycle call.
   //
-  // Payload wire order (design/architecture.md §2):
+  // Payload wire layout (design/architecture.md §2 + §12.6; byte
+  // offsets, not word indices, since @0.2 is no longer a uniform
+  // array of u64s):
   //
-  //   [0] record_audit_id
-  //   [1] event_kind         (argument — no longer hard-coded)
-  //   [2] record_exit_code
-  //   [3] record_op_name_ptr
-  //   [4] record_op_args_ptr
-  //   [5] record_output_schema_ptr
-  //   [6] record_output_hash
-  //   [7] record_parent_audit_id   (M3-002; 0 iff top-level)
+  //   [  0.. 8) record_audit_id       (#12: (pid << 32) | local_id)
+  //   [  8..16) event_kind            (argument — no longer hard-coded)
+  //   [ 16..24) record_exit_code
+  //   [ 24..32) record_parent_audit_id  (M3-002; 0 iff top-level)
+  //   [ 32..40) record_output_hash
+  //   [ 40..72) op_name       (32-byte inline string; #11)
+  //   [ 72..200) op_args      (128-byte inline string; #11)
+  //   [200..232) output_schema (32-byte inline string; #11)
+  //   [232..256) reserved, always zero (.bss zero-init; never written)
   //
-  // Writes the packed IPC header word (AUDIT_HDR_WORD = 0x00000040_00000120
-  // — op=0x20 | ver=1 | reply_ep=0 | payload_len=64) into
-  // audit_hdr_scratch, then invokes sys_ipc_send.
+  // The three inline string fields are copied byte-for-byte from the
+  // sender's own record_op_name_ptr / record_op_args_ptr /
+  // record_output_schema_ptr via the private audit_marshal_string
+  // helper (below) — #11 fix, replacing @0.1's verbatim pointer-value
+  // write.
   //
-  // Register plan: this function wraps two nested calls (audit_broker_
-  // bind + sys_ipc_send) and must preserve event_kind across the first
-  // one. r12 holds event_kind for the payload write; r13 pushed only
-  // to keep rsp % 16 == 0 at both nested calls (both callee-save; SysV
-  // preserves them across bind + sys_ipc_send).
+  // Writes the packed IPC header word (AUDIT_HDR_WORD =
+  // 0x00000100_00000220 — op=0x20 | ver=2 | reply_ep=0 |
+  // payload_len=256) into audit_hdr_scratch, then invokes sys_ipc_send.
+  //
+  // Register plan: this function wraps five nested calls (audit_
+  // broker_bind, three audit_marshal_string calls, sys_ipc_send) and
+  // must preserve event_kind across all of them. r12 holds event_kind
+  // for the payload write; r13 pushed only to keep rsp % 16 == 0 at
+  // every nested call (both callee-save; SysV preserves them across
+  // every call in this function, including the three new
+  // audit_marshal_string calls — that helper touches only rax/rcx/
+  // rdi/rsi/rdx/r9, never r12/r13).
   // ============================================================================
 
   pub let audit_send_record : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (event_kind: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "libpdx-audit.M2-001 + M2-002 + M2-003 + M3-002 + ENH-008: audit_send_record entry point. Supersedes M1's audit_send_committed_record which hard-coded UEJ_KIND_TOOL_INVOKE (130) at payload index [1]; M2-001 accepts event_kind in rdi so the three AuditClient lifecycle callsites (audit_begin -> INVOKE 130, audit_record_output -> OUTPUT 132, audit_commit -> EXIT 133) each write their own discriminator. M3-002 grows the wire format 56 → 64 bytes to carry record_parent_audit_id at payload index [7]; the kernel-side broker dispatch is still stubbed (audit_journal_broker_dispatch returns AJB_DISPATCH_STUB) so sys_ipc_send only enforces payload_len ≤ PENDING_PAYLOAD_MAX_BYTES, well above 64. Flow: (1) push r12; push r13 (callee-save; two pushes keep rsp % 16 == 0 for both nested calls). r12 = event_kind (saved across bind call — SysV preserves r12/r13 through audit_broker_bind + sys_ipc_send). (2) call audit_broker_bind — on non-zero return, propagate as AUDIT_ERR_BROKER_UNAVAILABLE via the cleanup epilogue. (3) Marshal the eight-u64 payload (M3-002): load each AuditRecord field via `lea r11,[rip+sym]; mov rax,[r11]; mov [scratch + N*8], rax`; write r12 (event_kind) at index [1]; write record_parent_audit_id at index [7]. (4) Write the packed hdr word AUDIT_HDR_WORD (0x0000_0040_0000_0120: op=0x20 AUDIT_EVENT | ver=1 | reply_endpoint_id=0 fire-and-forget | payload_len=64 — M3-002 change from 0x0000_0038 to 0x0000_0040 in the payload_len field of the low 32 bits) into audit_hdr_scratch via mov rax,imm64; mov [scratch],rax (paideia-as does not encode mov [mem],imm64 in one instruction). (5) Bounded retry-on-EAGAIN loop (M2-003). Initialise r13 = 0 (retry_count). Each iteration re-loads cached slot from audit_broker_slot into rdi and re-LEAs hdr/payload into rsi/rdx (rax may have been clobbered by the previous send attempt; rdi/rsi/rdx are caller-save so sys_ipc_send may have overwritten them too); mov rcx, 64; call sys_ipc_send. On rax == 0 (SYS_IPC_SEND_OK): fall through to asr_ok. On rax == 1 (SYS_IPC_SEND_ERR_EAGAIN — transient endpoint-queue-full): if r13 < 3, backoff (fixed 4096-cycle sub/cmp/jne spin — no dec/loop mnemonics) then r13 += 1 and jmp asr_retry. On r13 >= 3 (retry budget exhausted) or on any non-EAGAIN non-zero (BAD_ID/PAYLOAD_LEN/EFAULT/CHANDEAD — hard programming errors, no retry): fall to asr_ipc_fail. (6) On zero return, asr_ok returns AUDIT_OK; on non-zero-terminal, asr_ipc_fail writes 1 to AuditRecord::audit_broker_failed (M2-002 sticky flag — read by AuditClient::audit_can_emit_output to gate every consumer stdout write per D3 audit-first) AND (ENH-008) writes AUDIT_ERR_SEND_FAILED (4) to AuditRecord::audit_broker_failure_cause, then returns AUDIT_ERR_SEND_FAILED. Same sticky-flag write on the bind-failed path (asr_bind_fail), which ENH-008 pairs with an AUDIT_ERR_BROKER_UNAVAILABLE (3) cause write, so a broker-unreachable failure also refuses output AND is distinguishable after the fact from a send-retry exhaustion via AuditClient::audit_broker_failure_cause(). Register plan: r12 = event_kind (preserved across the bind call and every retry — SysV callee-save, sys_ipc_send preserves it), r13 = retry_count (0..3, callee-save, preserved by sys_ipc_send), r11 = LEA scratch (re-loaded every iteration), rax/rcx/rdi/rsi/rdx = caller-save (re-computed at every retry). sys_ipc_send handles the r10 shuffle internally. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Immediates: 64 (payload_len — M3-002), 0 (AUDIT_OK equality), 1 (EAGAIN gate + sticky-flag value), 3 (AUDIT_ERR_BROKER_UNAVAILABLE + retry-budget bound), 4 (AUDIT_ERR_SEND_FAILED), 4096 (backoff spin count) — all within paideia-as cmp-imm bounds. AUDIT_HDR_WORD fits inside a mov r64,imm64 which paideia-as encodes as a MOVABS. No test mnemonic; every zero-check is cmp rax, 0.",
+      justification: "libpdx-audit.M2-001 + M2-002 + M2-003 + M3-002 + ENH-008 + #11 + #12: audit_send_record entry point. M2-001 accepts event_kind in rdi so the three AuditClient lifecycle callsites (audit_begin -> INVOKE 130, audit_record_output -> OUTPUT 132, audit_commit -> EXIT 133) each write their own discriminator. @0.2 (#11 + #12) grows the wire format from the M3-002 64-byte / eight-u64-word shape to a 256-byte hybrid record: five u64 numeric words (offsets 0/8/16/24/32) followed by three fixed-size inline NUL-terminated string fields (offsets 40/72/200, widths 32/128/32) and 24 reserved bytes (offset 232, never written — stays at its .bss zero-init forever); the kernel-side broker dispatch is still stubbed (audit_journal_broker_dispatch returns AJB_DISPATCH_STUB) so sys_ipc_send only enforces payload_len ≤ PENDING_PAYLOAD_MAX_BYTES, well above 256. Flow: (1) push r12; push r13 (callee-save; two pushes keep rsp % 16 == 0 for every nested call in this function). r12 = event_kind (saved across every subsequent call — SysV preserves r12/r13 through audit_broker_bind, audit_marshal_string ×3, and sys_ipc_send). (2) call audit_broker_bind — on non-zero return, propagate as AUDIT_ERR_BROKER_UNAVAILABLE via the cleanup epilogue. (3) Marshal the five numeric header words via `lea r11,[rip+sym]; mov rax,[r11]; mov [scratch+off], rax` at their fixed byte offsets (0/16/24/32 from AuditRecord fields, 8 directly from r12/event_kind) — record_audit_id at offset 0 already carries #12's composed (pid << 32) | local_id value written by AuditClient::audit_begin, so this function needs no pid-awareness of its own; record_parent_audit_id at offset 24 is likewise an opaque u64 unaffected by #12's packing. (4) #11: call the private audit_marshal_string helper three times — (dst = scratch+40, src = record_op_name_ptr, max_len = 32), (dst = scratch+72, src = record_op_args_ptr, max_len = 128), (dst = scratch+200, src = record_output_schema_ptr, max_len = 32) — each copying the sender's own string BYTES into the payload rather than the @0.1 raw pointer value, which was meaningless outside the sending process's address space. Destination addresses are computed via `lea rdi,[rip+audit_payload_scratch]; add rdi, OFF` (two instructions; paideia-as has no `[rip+sym+imm]` form in use elsewhere in this repo, so this matches the existing offset-via-add idiom seen at every other scratch write in this function). (5) Write the packed hdr word AUDIT_HDR_WORD (0x0000_0100_0000_0220: op=0x20 AUDIT_EVENT | ver=2 (bumped from 1 so a future decoder can branch on frame version) | reply_endpoint_id=0 fire-and-forget | payload_len=256 — @0.2 change from 0x0000_0040 to 0x0000_0100 in the payload_len field of the low 32 bits) into audit_hdr_scratch via mov rax,imm64; mov [scratch],rax (paideia-as does not encode mov [mem],imm64 in one instruction). (6) Bounded retry-on-EAGAIN loop (M2-003), unchanged in shape from M3-002 other than payload_len. Initialise r13 = 0 (retry_count). Each iteration re-loads cached slot from audit_broker_slot into rdi and re-LEAs hdr/payload into rsi/rdx (rax may have been clobbered by the previous send attempt; rdi/rsi/rdx are caller-save so sys_ipc_send may have overwritten them too); mov rcx, 256; call sys_ipc_send. On rax == 0 (SYS_IPC_SEND_OK): fall through to asr_ok. On rax == 1 (SYS_IPC_SEND_ERR_EAGAIN — transient endpoint-queue-full): if r13 < 3, backoff (fixed 4096-cycle sub/cmp/jne spin — no dec/loop mnemonics) then r13 += 1 and jmp asr_retry. On r13 >= 3 (retry budget exhausted) or on any non-EAGAIN non-zero (BAD_ID/PAYLOAD_LEN/EFAULT/CHANDEAD — hard programming errors, no retry): fall to asr_ipc_fail. (7) On zero return, asr_ok returns AUDIT_OK; on non-zero-terminal, asr_ipc_fail writes 1 to AuditRecord::audit_broker_failed (M2-002 sticky flag — read by AuditClient::audit_can_emit_output to gate every consumer stdout write per D3 audit-first) AND (ENH-008) writes AUDIT_ERR_SEND_FAILED (4) to AuditRecord::audit_broker_failure_cause, then returns AUDIT_ERR_SEND_FAILED. Same sticky-flag write on the bind-failed path (asr_bind_fail), which ENH-008 pairs with an AUDIT_ERR_BROKER_UNAVAILABLE (3) cause write, so a broker-unreachable failure also refuses output AND is distinguishable after the fact from a send-retry exhaustion via AuditClient::audit_broker_failure_cause(). Register plan: r12 = event_kind (preserved across the bind call, every audit_marshal_string call, and every retry — SysV callee-save, every callee preserves it), r13 = retry_count (0..3, callee-save, preserved throughout), r11 = LEA scratch (re-loaded every iteration), rax/rcx/rdi/rsi/rdx = caller-save (re-computed at every retry and around every audit_marshal_string call). sys_ipc_send handles the r10 shuffle internally. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Immediates: 256 (payload_len — @0.2), 40/72/200 (inline string field offsets), 32/128/32 (inline string field widths), 0 (AUDIT_OK equality), 1 (EAGAIN gate + sticky-flag value), 3 (AUDIT_ERR_BROKER_UNAVAILABLE + retry-budget bound), 4 (AUDIT_ERR_SEND_FAILED), 4096 (backoff spin count) — all within paideia-as cmp-imm bounds. AUDIT_HDR_WORD fits inside a mov r64,imm64 which paideia-as encodes as a MOVABS. No test mnemonic; every zero-check is cmp rax, 0.",
       block: {
         // ---- Prologue: save callee-save regs, stash event_kind. -------
         push r12;
@@ -166,60 +190,81 @@ module AuditBroker = structure {
         cmp rax, 0;                              // AUDIT_OK
         jne asr_bind_fail;                       // rax already AUDIT_ERR_BROKER_UNAVAILABLE
 
-        // ---- Step 2: marshal the seven-u64 payload into scratch. ------
-        // Index [0] — record_audit_id
+        // ---- Step 2: marshal the @0.2 hybrid payload into scratch. ----
+        //      Five numeric header words first (offsets 0/8/16/24/32),
+        //      then three inline string fields via audit_marshal_string
+        //      (#11), then 24 reserved bytes left at .bss zero-init.
+        // Offset 0 — record_audit_id (#12: already the composed
+        //            (pid << 32) | local_id value from audit_begin).
         lea r11, [rip + record_audit_id];
         mov rax, [r11];
         lea r11, [rip + audit_payload_scratch];
         mov [r11 + 0], rax;
 
-        // Index [1] — event_kind (from r12 saved on entry)
+        // Offset 8 — event_kind (from r12 saved on entry)
         lea r11, [rip + audit_payload_scratch];
         mov [r11 + 8], r12;
 
-        // Index [2] — record_exit_code
+        // Offset 16 — record_exit_code
         lea r11, [rip + record_exit_code];
         mov rax, [r11];
         lea r11, [rip + audit_payload_scratch];
         mov [r11 + 16], rax;
 
-        // Index [3] — record_op_name_ptr
-        lea r11, [rip + record_op_name_ptr];
+        // Offset 24 — record_parent_audit_id (M3-002; opaque u64,
+        //             unaffected by #12's packing of THIS process's
+        //             own audit_id — a parent's id already arrives
+        //             here pre-composed via audit_set_parent).
+        lea r11, [rip + record_parent_audit_id];
         mov rax, [r11];
         lea r11, [rip + audit_payload_scratch];
         mov [r11 + 24], rax;
 
-        // Index [4] — record_op_args_ptr
-        lea r11, [rip + record_op_args_ptr];
+        // Offset 32 — record_output_hash
+        lea r11, [rip + record_output_hash];
         mov rax, [r11];
         lea r11, [rip + audit_payload_scratch];
         mov [r11 + 32], rax;
 
-        // Index [5] — record_output_schema_ptr
+        // Offset 40 (32 bytes) — op_name, inlined from the sender's own
+        // address space (#11 fix: @0.1 sent record_op_name_ptr
+        // verbatim, a VA meaningless to the broker process).
+        // audit_marshal_string copies up to 31 source bytes + a
+        // guaranteed NUL, zero-padding the rest; src_ptr == 0 yields
+        // an all-zero (empty) field.
+        lea rdi, [rip + audit_payload_scratch];
+        add rdi, 40;                             // AUDIT_OFF_OP_NAME
+        lea r11, [rip + record_op_name_ptr];
+        mov rsi, [r11];
+        mov rdx, 32;                             // AUDIT_OP_NAME_BYTES
+        call audit_marshal_string;
+
+        // Offset 72 (128 bytes) — op_args, same #11 inlining.
+        lea rdi, [rip + audit_payload_scratch];
+        add rdi, 72;                             // AUDIT_OFF_OP_ARGS
+        lea r11, [rip + record_op_args_ptr];
+        mov rsi, [r11];
+        mov rdx, 128;                            // AUDIT_OP_ARGS_BYTES
+        call audit_marshal_string;
+
+        // Offset 200 (32 bytes) — output_schema, same #11 inlining.
+        lea rdi, [rip + audit_payload_scratch];
+        add rdi, 200;                            // AUDIT_OFF_OUTPUT_SCHEMA
         lea r11, [rip + record_output_schema_ptr];
-        mov rax, [r11];
-        lea r11, [rip + audit_payload_scratch];
-        mov [r11 + 40], rax;
+        mov rsi, [r11];
+        mov rdx, 32;                             // AUDIT_OUTPUT_SCHEMA_BYTES
+        call audit_marshal_string;
 
-        // Index [6] — record_output_hash
-        lea r11, [rip + record_output_hash];
-        mov rax, [r11];
-        lea r11, [rip + audit_payload_scratch];
-        mov [r11 + 48], rax;
-
-        // Index [7] — record_parent_audit_id (M3-002).
-        //             0 iff top-level (no parent).
-        lea r11, [rip + record_parent_audit_id];
-        mov rax, [r11];
-        lea r11, [rip + audit_payload_scratch];
-        mov [r11 + 56], rax;
+        // Offset 232..256 — 24 reserved bytes. Never written by any
+        // code path; audit_payload_scratch's .bss zero-init holds for
+        // the lifetime of the process since this region is never
+        // repurposed.
 
         // ---- Step 3: write the packed hdr word. -----------------------
-        // M3-002: payload_len grew 56 → 64 to accommodate the new
-        // parent_audit_id slot; low 32 bits are unchanged (op 0x20 |
-        // ver 1 | reply_ep 0 = 0x00000120), the payload_len field in
-        // the high 32 bits moves 0x38 → 0x40.
-        mov rax, 0x0000004000000120;             // AUDIT_HDR_WORD (M3-002)
+        // @0.2: payload_len grows 64 → 256 to accommodate the hybrid
+        // record; ver bumps 1 → 2 so a future decoder can branch on
+        // frame version. op / reply_ep are unchanged.
+        mov rax, 0x0000010000000220;             // AUDIT_HDR_WORD (@0.2)
         lea r11, [rip + audit_hdr_scratch];
         mov [r11], rax;
 
@@ -239,7 +284,7 @@ module AuditBroker = structure {
         mov rdi, [r11];                          // cap_slot
         lea rsi, [rip + audit_hdr_scratch];      // hdr_va
         lea rdx, [rip + audit_payload_scratch];  // payload_va
-        mov rcx, 64;                             // payload_len (AUDIT_PAYLOAD_BYTES; M3-002 grew 56→64)
+        mov rcx, 256;                            // payload_len (AUDIT_PAYLOAD_BYTES; @0.2 grew 64→256)
         call sys_ipc_send;
 
         cmp rax, 0;                              // SYS_IPC_SEND_OK ?
@@ -304,6 +349,110 @@ module AuditBroker = structure {
         mov rax, 3;                              // AUDIT_ERR_BROKER_UNAVAILABLE (re-assert)
         pop r13;
         pop r12;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // audit_marshal_string(dst_ptr, src_ptr, max_len) -> ()  [private, #11]
+  //   rdi = dst_ptr   (absolute VA inside audit_payload_scratch)
+  //   rsi = src_ptr   (sender-owned NUL-terminated string; 0 is legal —
+  //                    produces an all-zero/empty field, e.g. op_args
+  //                    when the tool has no argv beyond op_name, or
+  //                    output_schema before OUTPUT)
+  //   rdx = max_len   (destination field capacity in bytes, INCLUDING
+  //                    the NUL terminator; every call site passes a
+  //                    compile-time constant — 32 / 128 / 32 for the
+  //                    three @0.2 inline string fields)
+  //
+  // #11 fix. Prior to @0.2, audit_send_record wrote the sender's raw
+  // pointer value (record_op_name_ptr / record_op_args_ptr /
+  // record_output_schema_ptr) into the wire payload — a VA meaningful
+  // only inside the sending process's own address space. The broker
+  // (a DIFFERENT process) received an opaque integer where readable
+  // text belonged. audit_marshal_string instead copies the bytes
+  // themselves — always dereferencing src_ptr from within the SENDING
+  // process, before sys_ipc_send bounces the payload, so the read is
+  // always in-process and safe — up to `max_len - 1` bytes (stopping
+  // early at the source's own NUL), then zero-pads the rest of the
+  // destination field, including always leaving byte `max_len - 1`
+  // zero so a truncated source string is still NUL-terminated inside
+  // its field.
+  //
+  // Not `pub` — private marshalling helper, called only from
+  // audit_send_record in this module.
+  //
+  // Register plan (leaf; no nested call, no callee-save touched):
+  //   rdi = dst cursor (mutated: walks forward one byte per store)
+  //   rsi = src cursor (mutated: walks forward one byte per load;
+  //         never dereferenced when it started at 0)
+  //   rdx = max_len (read-only)
+  //   r9  = max copyable byte count (max_len - 1; reserves the last
+  //         destination byte so an over-length source is still
+  //         terminated)
+  //   rcx = byte index (0 .. max_len)
+  //   rax = byte scratch (zero-extended via the paideia-as #1248
+  //         xor+mov_b pattern before every load)
+  //
+  // Byte loads/stores walk the src/dst pointers directly (`add rdi/
+  // rsi, 1` per iteration) rather than an indexed `[base + idx*1]`
+  // form — matching src/tools/mkfs-pdxb/uuid.pdx's parse_dashed loop
+  // in paideia-os — so no SIB-scale encoding (U1606) is at risk. No
+  // `add reg, [mem]` anywhere; every add is reg+imm or reg+reg. No
+  // test mnemonic; every zero-check is cmp reg, 0.
+  // ============================================================================
+
+  let audit_marshal_string : (u64, u64, u64) -> () !{mem} @{} =
+    fn (dst_ptr: u64) (src_ptr: u64) (max_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit#11: audit_marshal_string private helper. Copies up to (max_len - 1) bytes from src_ptr (a live pointer in the CALLING process's address space — this function runs inside the sender, before sys_ipc_send bounces the payload, so the dereference is always in-process and safe) into dst_ptr inside audit_payload_scratch, stopping early at the source's NUL terminator, then zero-fills every remaining destination byte up to max_len — including always leaving the very last byte (index max_len-1) zero, guaranteeing the field is NUL-terminated even when the source is longer than the field can hold. src_ptr == 0 (legal: op_args may be unset; output_schema is 0 before OUTPUT) skips straight to the zero-fill path via the ams_zero_fill branch, producing an all-zero (empty-string) field. Copy loop bound is r9 = max_len - 1 (computed once via `mov r9, rdx; sub r9, 1`) rather than max_len itself, so the copy loop never writes the reserved terminator byte; the pad loop (shared by both the copy-then-pad and the src==0 paths) then zero-fills from wherever the copy loop stopped through max_len, which always includes that reserved byte. Byte load: `xor rax, rax; mov_b rax, [rsi]` (paideia-as #1248 mitigation — mov_b does not zero-extend on its own; matches src/audit_hash.pdx's audit_hash_update). Byte store: `mov_b [rdi], rax` (G1 sized-store form per src/tools/mkfs-pdxb/uuid.pdx's ph32_top loop in paideia-os — a bare qword-sized store to a byte destination is not portable). Both src and dst are walked via `add reg, 1` per iteration rather than an indexed addressing form, avoiding the SIB-scale-fold operand-parse bug (U1606) that requires an explicit `*1` scale on an indexed byte load — sidestepped entirely here by never using indexed addressing, matching paideia-os's parse_dashed loop shape. Pure leaf — no push/pop, no nested call; r9 is caller-save under SysV and this function makes no call of its own, so clobbering it is safe. Effects `!{mem} @{}` — pure memory read (sender's own string) + write (audit_payload_scratch), no syscall, no cap. Label prefix ams_ per the reserved-label discipline (bare loop/done-style labels collide with paideia-as keywords). Immediates: 0 (src_ptr null-check, byte-zero-check), 1 (the `sub r9, 1` terminator reservation and the per-iteration pointer/index advance) — both within the 0x7FFFFFFF cmp-imm bound.",
+      block: {
+        xor rcx, rcx;                            // byte index = 0
+        mov r9, rdx;
+        sub r9, 1;                               // r9 = max copyable count (reserve last byte)
+
+        cmp rsi, 0;                              // src_ptr == 0 ?
+        je  ams_zero_fill;
+
+      ams_copy_loop:
+        cmp rcx, r9;
+        jae ams_pad;
+
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0;                              // source NUL ?
+        je  ams_pad;
+
+        mov_b [rdi], rax;
+        add rdi, 1;
+        add rsi, 1;
+        add rcx, 1;
+        jmp ams_copy_loop;
+
+      ams_pad:
+        cmp rcx, rdx;
+        jae ams_done;
+
+        xor rax, rax;
+        mov_b [rdi], rax;
+        add rdi, 1;
+        add rcx, 1;
+        jmp ams_pad;
+
+      ams_zero_fill:
+        xor rcx, rcx;
+
+      ams_zero_loop:
+        cmp rcx, rdx;
+        jae ams_done;
+
+        xor rax, rax;
+        mov_b [rdi], rax;
+        add rdi, 1;
+        add rcx, 1;
+        jmp ams_zero_loop;
+
+      ams_done:
         ret;
       }
     }

@@ -8,6 +8,30 @@ Source-verified audit pass against the four real consumers (`rm`,
 `ENH-*` issues as they land; a version bump + CHANGELOG rollup happens
 at the next formal release cut.
 
+- **#11 + #12** `PdxAuditRecord@0.1 → @0.2` — coordinated wire
+  revision (shipped together deliberately; see
+  `design/architecture.md` §12.6). **#11**: `op_name_ptr` /
+  `op_args_ptr` / `output_schema_ptr` were live VAs in the sending
+  process — meaningless outside it; the audit-journal daemon received
+  opaque integers where readable text belonged. `AuditBroker::
+  audit_send_record` now inlines the actual string bytes via a new
+  private `audit_marshal_string` helper (chosen: fixed-size inline
+  arrays, 32/128/32 bytes, over a length-prefixed tail or a
+  cap-transferred string region — see §12.6.1 for the full
+  trade-off). **#12**: `audit_id` was a bare per-process monotonic
+  counter, so every tool's first audit was `audit_id == 1`, breaking
+  the M3-002 parent-linkage feature for any shell running more than
+  one child. `AuditClient::audit_begin` now composes the wire
+  `audit_id` as `(pid << 32) | local_id`, using the existing
+  `sys_getpid` syscall (SC+ ID 39, no kernel change required — only a
+  new userspace trampoline in `src/syscall_shim.pdx`; chosen over a
+  new kernel syscall or a daemon-side rewrite-at-receipt, see
+  §12.6.2). `AUDIT_PAYLOAD_BYTES` 64 → 256, `AUDIT_HDR_WORD`
+  `0x0000004000000120` → `0x0000010000000220` (payload_len 256, ver
+  bumped 1 → 2). New `AuditRecord::audit_process_pid` .bss slot
+  (never cleared by `reset()` — a pid cannot change for a process's
+  lifetime). No consumer-visible signature or effect-set change on
+  `audit_begin` / `audit_record_output` / `audit_commit`.
 - **ENH-007** `caps.decl` refresh — wire schema was still described as
   the M1 56-byte stub; now states the landed 64-byte / eight-u64-word
   `PdxAuditRecord@0.1` shape and adds an explicit `wire_ownership`

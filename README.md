@@ -18,8 +18,9 @@ rather than per-tool code.
 Concretely, the library does **not** write files. It resolves the
 well-known service name `"svc.audit-journal"` to an IPC endpoint
 capability via `sys_svc_lookup` (SC+ ID 43), then publishes a fixed
-64-byte record over that endpoint with `sys_ipc_send` (SC+ ID 42) at
-each of three lifecycle points — INVOKE, OUTPUT, EXIT. Materialising
+256-byte record (`PdxAuditRecord@0.2`) over that endpoint with
+`sys_ipc_send` (SC+ ID 42) at each of three lifecycle points — INVOKE,
+OUTPUT, EXIT. Materialising
 that stream as journal entries under `/system/audit/user-events/` is the
 audit-journal daemon's job; at v1.0.0 the kernel-side dispatch is still
 a stub (`audit_journal_broker_dispatch` returns `AJB_DISPATCH_STUB`), so
@@ -38,7 +39,7 @@ capability set, both as declared on the `pub let`.
 
 | Signature | Purpose |
 |---|---|
-| `audit_begin(op_name, op_args) -> u64 !{mem, sysreg} @{cap, sched}` | Open an audit. Requires `record_state == IDLE`; allocates a monotonic `audit_id`, stores the two NUL-terminated string pointers, transitions IDLE → BEGUN, and emits `UEJ_KIND_TOOL_INVOKE`. Returns the id (> 0) or **0** on state-gate failure *or* send failure — **this is a bare 0 sentinel, not negative-errno**; do not `cmp rax, 0; jl` against it (always false). Call `audit_last_error()` after a 0 return to tell the two failure causes apart. |
+| `audit_begin(op_name, op_args) -> u64 !{mem, sysreg} @{cap, sched}` | Open an audit. Requires `record_state == IDLE`; allocates a globally-unique `audit_id` (post-1.0.0, `#12` — see below), stores the two NUL-terminated string pointers, transitions IDLE → BEGUN, and emits `UEJ_KIND_TOOL_INVOKE`. Returns the id (> 0) or **0** on state-gate failure *or* send failure — **this is a bare 0 sentinel, not negative-errno**; do not `cmp rax, 0; jl` against it (always false). Call `audit_last_error()` after a 0 return to tell the two failure causes apart. |
 | `audit_last_error() -> u64 !{mem} @{}` | Post-1.0.0 (ENH-006). The real cause of the most recent `audit_begin`: `AUDIT_OK` on success or before any call, `AUDIT_ERR_STATE` on the IDLE-gate branch, or the verbatim `AUDIT_ERR_BROKER_UNAVAILABLE` / `AUDIT_ERR_SEND_FAILED` from a failed INVOKE send. |
 | `audit_broker_failure_cause() -> u64 !{mem} @{}` | Post-1.0.0 (ENH-008). Diagnostic-only companion to `audit_can_emit_output`: tells a bind failure (`AUDIT_ERR_BROKER_UNAVAILABLE`) apart from a send failure (`AUDIT_ERR_SEND_FAILED`) once the sticky `audit_broker_failed` flag is set. `AUDIT_OK` before any failure. Sticky-forever policy: only `reset()` clears it — this is diagnosis, not a recovery primitive. See `design/architecture.md` §7.2. |
 | `audit_record_output(audit_id, output_schema, output_hash) -> u64 !{mem, sysreg} @{cap, sched}` | Declare the schema-typed output about to be emitted. Gates on state == BEGUN **or** OUTPUT (post-1.0.0, ENH-003 — was BEGUN-only) then on id match, (re-)transitions to OUTPUT, emits its own `UEJ_KIND_TOOL_OUTPUT`. Re-entrant from OUTPUT: a multi-target operation may call it once per target on one open audit. Optional: a tool with no schema-typed output may go straight to commit. |
@@ -65,7 +66,7 @@ identical either way.
 | Signature | Purpose |
 |---|---|
 | `audit_broker_bind() -> u64 !{mem, sysreg} @{cap}` | Idempotent bind of `svc.audit-journal`. Fast path returns `AUDIT_OK` when the cached slot is not `AUDIT_BROKER_SLOT_UNRESOLVED`; slow path calls `sys_svc_lookup` and accepts the result only when `< 256` (every negative-errno sentinel has bit 63 set, so `cmp rax, 256; jae` discriminates). |
-| `audit_send_record(event_kind) -> u64 !{mem, sysreg} @{cap, sched}` | Marshal the eight-`u64` payload from the singleton, write the packed IPC header, and `sys_ipc_send`. Bounded retry: up to 3 retries on `SYS_IPC_SEND_ERR_EAGAIN` (1) with a 4096-cycle spin backoff; every other non-zero return hard-fails with no retry. Both failure epilogues set the sticky `audit_broker_failed` flag. |
+| `audit_send_record(event_kind) -> u64 !{mem, sysreg} @{cap, sched}` | Marshal the `@0.2` 256-byte hybrid payload from the singleton (five `u64` header words + three inline strings via the private `audit_marshal_string` helper — post-1.0.0, `#11`), write the packed IPC header, and `sys_ipc_send`. Bounded retry: up to 3 retries on `SYS_IPC_SEND_ERR_EAGAIN` (1) with a 4096-cycle spin backoff; every other non-zero return hard-fails with no retry. Both failure epilogues set the sticky `audit_broker_failed` flag. |
 
 Also exported: `audit_broker_name : [u8; 20] = "svc.audit-journal\0\0\0"`
 and `AUDIT_BROKER_NAME_LEN : u64 = 17`, byte-for-byte the kernel-side
@@ -94,20 +95,32 @@ Exported constants:
   `AUDIT_ERR_ID_MISMATCH` 2, `AUDIT_ERR_BROKER_UNAVAILABLE` 3,
   `AUDIT_ERR_SEND_FAILED` 4, `AUDIT_ERR_HASH_INACTIVE` 5.
 - States — `AUDIT_STATE_IDLE` 0, `BEGUN` 1, `OUTPUT` 2, `COMMITTED` 3.
-- Wire — `AUDIT_PAYLOAD_BYTES` 64, `AUDIT_HDR_WORD` `0x0000004000000120`.
+- Wire — `AUDIT_PAYLOAD_BYTES` 256, `AUDIT_HDR_WORD`
+  `0x0000010000000220` (post-1.0.0, `@0.2` — was 64 /
+  `0x0000004000000120` through v1.0.0). Offset/width constants:
+  `AUDIT_OFF_AUDIT_ID` 0, `AUDIT_OFF_EVENT_KIND` 8,
+  `AUDIT_OFF_EXIT_CODE` 16, `AUDIT_OFF_PARENT_ID` 24,
+  `AUDIT_OFF_OUTPUT_HASH` 32, `AUDIT_OFF_OP_NAME` 40 (width
+  `AUDIT_OP_NAME_BYTES` 32), `AUDIT_OFF_OP_ARGS` 72 (width
+  `AUDIT_OP_ARGS_BYTES` 128), `AUDIT_OFF_OUTPUT_SCHEMA` 200 (width
+  `AUDIT_OUTPUT_SCHEMA_BYTES` 32), `AUDIT_OFF_RESERVED` 232 (width
+  `AUDIT_RESERVED_BYTES` 24).
 - Event kinds — `UEJ_KIND_TOOL_INVOKE` 130, `UEJ_KIND_TOOL_OUTPUT` 132,
   `UEJ_KIND_TOOL_EXIT` 133.
 - Sentinels/primitives — `AUDIT_BROKER_SLOT_UNRESOLVED` `0xFFFF`,
   `FNV_OFFSET_BASIS`, `FNV_PRIME`.
 
 Storage (all `pub let mut … : u64 = uninit @align(8)`, relying on `.bss`
-zeroing): `audit_id_next`, `record_audit_id`, `record_op_name_ptr`,
-`record_op_args_ptr`, `record_output_schema_ptr`, `record_output_hash`,
-`record_exit_code`, `record_state`, `audit_broker_slot`,
-`record_parent_audit_id`, `audit_broker_failed`, `record_hash_state`,
-`record_hash_active`, `audit_last_error` (ENH-006),
-`audit_broker_failure_cause` (ENH-008), plus the send scratch
-`audit_payload_scratch : [u64; 8]` and `audit_hdr_scratch : u64`.
+zeroing, unless noted): `audit_id_next`, `record_audit_id`,
+`record_op_name_ptr`, `record_op_args_ptr`, `record_output_schema_ptr`,
+`record_output_hash`, `record_exit_code`, `record_state`,
+`audit_broker_slot`, `record_parent_audit_id`, `audit_broker_failed`,
+`record_hash_state`, `record_hash_active`, `audit_last_error`
+(ENH-006), `audit_broker_failure_cause` (ENH-008),
+`audit_process_pid` (post-1.0.0, `#12` — never cleared by `reset()`;
+see `design/architecture.md` §12.6.2), plus the send scratch
+`audit_payload_scratch : [u8; 256]` (post-1.0.0, `@0.2`; was
+`[u64; 8]`) and `audit_hdr_scratch : u64`.
 
 ### `src/syscall_shim.pdx` — `SyscallShim`
 
@@ -115,45 +128,55 @@ zeroing): `audit_id_next`, `record_audit_id`, `record_op_name_ptr`,
 |---|---|
 | `sys_svc_lookup(name_ptr, name_len) -> u64 !{mem, sysreg} @{cap}` | SC+ ID 43 trampoline. Resolves a broker name to a fresh `KIND_IPC_ENDPOINT` cap slot in `[0..255]`, or a negative-errno sentinel. |
 | `sys_ipc_send(cap_slot, user_hdr_va, user_payload_va, payload_len) -> u64 !{mem, sysreg} @{cap, sched}` | SC+ ID 42 trampoline. Non-blocking send; arity 4 so it performs the SysV → SYSCALL `rcx → r10` shuffle. |
+| `sys_getpid() -> u64 !{sysreg} @{}` | Post-1.0.0 (`#12`). SC+ ID 39 trampoline. Zero-arg; returns the caller's pid, never 0. `audit_begin` calls this at most once per process to seed `AuditRecord::audit_process_pid`. |
 
 ## Schemas exposed
 
-`caps.decl` declares one output schema: **`PdxAuditRecord@0.1`**. Its
-on-wire form is the fixed 64-byte payload `audit_send_record` marshals —
-eight `u64` words, identical for all three lifecycle events, with only
-`event_kind` varying:
+`caps.decl` declares one output schema: **`PdxAuditRecord@0.2`**
+(post-1.0.0 — supersedes `@0.1`; see `design/architecture.md` §12.6 for
+the full rationale). Its on-wire form is a fixed 256-byte hybrid
+record `audit_send_record` marshals — five `u64` header words followed
+by three fixed-size inline NUL-terminated string fields and 24
+reserved bytes, identical for all three lifecycle events except
+`event_kind` and (until `OUTPUT`) `output_schema`:
 
-| # | Offset | Field | Source slot | Meaning |
+| Offset | Width | Field | Source slot | Meaning |
 |---|---|---|---|---|
-| 0 | 0  | `audit_id` | `record_audit_id` | monotonic per-process id, allocated from 1; `0` is the "no audit" sentinel |
-| 1 | 8  | `event_kind` | argument | 130 INVOKE / 132 OUTPUT / 133 EXIT |
-| 2 | 16 | `exit_code` | `record_exit_code` | written by `audit_commit`; `0` before it |
-| 3 | 24 | `op_name_ptr` | `record_op_name_ptr` | live pointer to a caller-owned NUL-terminated string |
-| 4 | 32 | `op_args_ptr` | `record_op_args_ptr` | live pointer, caller-owned; may be `0` |
-| 5 | 40 | `output_schema_ptr` | `record_output_schema_ptr` | live pointer to the schema name; `0` until `audit_record_output` |
-| 6 | 48 | `output_hash` | `record_output_hash` | truncated output digest (FNV-1a-64 today) |
-| 7 | 56 | `parent_audit_id` | `record_parent_audit_id` | `0` iff top-level; else the parent's `audit_id` |
+| 0   | 8   | `audit_id` | `record_audit_id` | `(pid << 32) \| local_id` (`#12`) — globally unique across processes; `0` is the "no audit" sentinel |
+| 8   | 8   | `event_kind` | argument | 130 INVOKE / 132 OUTPUT / 133 EXIT |
+| 16  | 8   | `exit_code` | `record_exit_code` | written by `audit_commit`; `0` before it |
+| 24  | 8   | `parent_audit_id` | `record_parent_audit_id` | `0` iff top-level; else the parent's composed `audit_id` |
+| 32  | 8   | `output_hash` | `record_output_hash` | truncated output digest (FNV-1a-64 today) |
+| 40  | 32  | `op_name` | `record_op_name_ptr` (inlined) | NUL-terminated text, zero-padded (`#11`) |
+| 72  | 128 | `op_args` | `record_op_args_ptr` (inlined) | NUL-terminated text, zero-padded; may be all-zero |
+| 200 | 32  | `output_schema` | `record_output_schema_ptr` (inlined) | NUL-terminated text, zero-padded; all-zero until `audit_record_output` |
+| 232 | 24  | *reserved* | — | always zero |
 
 The IPC frame header is one packed `u64`, `AUDIT_HDR_WORD =
-0x0000_0040_0000_0120` — op `0x20` (AUDIT_EVENT), ver 1,
-`reply_endpoint_id` 0 (fire-and-forget), `payload_len` 64.
+0x0000_0100_0000_0220` — op `0x20` (AUDIT_EVENT), ver 2,
+`reply_endpoint_id` 0 (fire-and-forget), `payload_len` 256.
 
 Two properties worth stating plainly, because they surprise readers who
 expect a self-describing log line:
 
-- **The record carries pointers, not bytes.** Fields 3, 4 and 5 are live
-  virtual addresses into caller-owned memory. libpdx-audit never copies
-  or mutates those strings, so the consumer must keep the backing pages
-  alive from `audit_begin` through `audit_commit` (the lifetime of one
-  tool invocation, so this is the default).
+- **The record now carries bytes, not pointers (post-1.0.0, `#11`).**
+  Through v1.0.0, `op_name` / `op_args` / `output_schema` were live
+  virtual addresses into caller-owned memory — meaningless outside the
+  sending process. `audit_send_record` now copies the string bytes
+  themselves into three fixed-size inline fields via the private
+  `AuditBroker::audit_marshal_string` helper, so a broker-side reader
+  with no access to the sender's address space can decode them as
+  text directly.
 - **There is no timestamp and no actor field.** Neither appears anywhere
   in the source wire format. Both are the journal daemon's to stamp on
   receipt; consumers that need their own timing keep it in their own
   record (the shell's `ShellCommandRecord` carries `ts_begin_ns` /
   `ts_end_ns` itself).
 
-Wire stability at v1.0.0: any grow past `[u64; 8]`, error-code
-renumber, or state-machine change is a major bump. See
+Wire stability at v1.0.0 stated "any grow past `[u64; 8]`, error-code
+renumber, or state-machine change is a major bump" — `@0.2` is exactly
+such a bump, landed as a coordinated, deliberate wire revision (issues
+`#11` + `#12`) rather than an incremental grow. See
 [`CHANGELOG.md`](CHANGELOG.md) § *Semver policy*.
 
 ## Callers
@@ -196,10 +219,16 @@ the semver policy, and the four known deferred substrates (BLAKE3
 intrinsic, QEMU end-to-end smoke, the `pkgs.paideia-os` mirror, the
 `doc` M2 compile pass) are in [`CHANGELOG.md`](CHANGELOG.md).
 
-`main` carries three post-tag commits — `tools/build.sh` plus two
+`main` carries post-tag commits beyond `tools/build.sh` and the two
 paideia-as conformance build fixes (a `mov_b` SIB-scale form and a
-missing statement terminator). No signature, effect, or wire-format
-change since the tag.
+missing statement terminator): the `#11` + `#12` coordinated wire
+revision (`PdxAuditRecord@0.1 → @0.2`, see `design/architecture.md`
+§12.6) IS a wire-format change — `AUDIT_PAYLOAD_BYTES` /
+`AUDIT_HDR_WORD` both changed and `audit_id`'s composition changed —
+though `audit_begin` / `audit_record_output` / `audit_commit`'s
+signatures and effect sets are unchanged. A version bump + CHANGELOG
+rollup happens at the next formal release cut, same as every other
+post-1.0.0 `ENH-*` entry.
 
 Further reading: [`design/architecture.md`](design/architecture.md)
 (state machine, storage model, primitive-swap policy),

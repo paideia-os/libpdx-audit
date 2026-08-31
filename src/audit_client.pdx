@@ -1,4 +1,4 @@
-// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002 + M2-001 + M2-002 + M3-002 + ENH-005 + ENH-006 + ENH-008
+// src/audit_client.pdx — libpdx-audit.M1-001 + M1-002 + M2-001 + M2-002 + M3-002 + ENH-005 + ENH-006 + ENH-008 + #12
 // AuditClient: three-call user-facing API — audit_begin, audit_record_
 // output, audit_commit. State-machine gating per design/architecture.md
 // §4; wire format per §2. M1-002 stitched the send path in at commit;
@@ -26,13 +26,27 @@
 //   audit_last_error (ENH-006 write in audit_begin, read in the new
 //   audit_last_error accessor), audit_broker_failure_cause (ENH-008
 //   read in the new audit_broker_failure_cause accessor; written by
-//   AuditBroker::audit_send_record)
-// Cross-module functions called (M2-001):
-//   audit_send_record  (src/audit_broker.pdx)
+//   AuditBroker::audit_send_record), audit_process_pid (#12 lazy-init
+//   cache written + read by audit_begin)
+// Cross-module functions called:
+//   audit_send_record  (src/audit_broker.pdx, M2-001)
 //   audit_rearm        (src/audit_record.pdx, ENH-004, called from
 //                        audit_begin right after its IDLE gate)
+//   sys_getpid         (src/syscall_shim.pdx, libpdx-audit#12, called
+//                        from audit_begin at most once per process)
 // Resolved by unqualified linker name — the same pattern
 // libpdx-argv's parser.pdx uses to read ParsedArgs::flag_count.
+//
+// #12 (audit_id global uniqueness): audit_begin now composes the wire
+// audit_id as `(pid << 32) | local_id` rather than handing out the
+// bare per-process monotonic counter. `local_id` is still exactly the
+// @0.1 audit_id_next allocation (unbounded-in-principle, "not a
+// shipping concern" per §5 of design/architecture.md); packing it into
+// the low 32 bits of the composed id bounds it in practice to ~4.29e9
+// audits per process, still enormous. `pid` comes from
+// AuditRecord::audit_process_pid, lazily fetched via sys_getpid and
+// cached forever. See design/architecture.md §12.6 for the collision
+// analysis and the chosen-Option-B rationale.
 
 module AuditClient = structure {
 
@@ -47,20 +61,29 @@ module AuditClient = structure {
   // Requires record_state == AUDIT_STATE_IDLE. On success transitions
   // record_state to AUDIT_STATE_BEGUN and returns the newly-allocated
   // audit_id. Lazy-inits audit_id_next to 1 on the very first call so
-  // audit_id 0 remains the "no audit in progress" sentinel.
+  // a LOCAL id of 0 remains the "no audit in progress" sentinel.
   //
-  // Register plan (leaf; no callee-save touched):
+  // #12: the returned audit_id is `(pid << 32) | local_id`, not the
+  // bare local_id — see the module header comment above and design/
+  // architecture.md §12.6. record_audit_id / the wire payload's
+  // audit_id field both carry the COMPOSED value; only audit_id_next
+  // itself stays a plain per-process counter.
+  //
+  // Register plan (leaf w.r.t. callee-saves other than the r14/r15
+  // pair pushed around the #12 pid composition):
   //   r11 = LEA scratch (paideia-as reserved scratch; every cross-module
   //         write is r11-based)
-  //   rax = state-load / id-allocation / return value
+  //   rax = state-load / id-allocation / pid-load / return value
   //   rcx = new state / new counter (avoids reusing rax across the two
   //         adjacent stores)
+  //   r14 = local_id, held across the sys_getpid call (#12)
+  //   r15 = alignment pair for r14's push/pop
   // ============================================================================
 
   pub let audit_begin : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (op_name: u64) (op_args: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "libpdx-audit.M1-001 + M1-002 + M2-001 + ENH-004 + ENH-006: audit_begin entry point. Validates record_state == AUDIT_STATE_IDLE (0) via cmp reg, 0 (no test mnemonic per paideia-as conformance); on gate failure returns 0 to signal AUDIT_ERR_STATE, AND (ENH-006) writes AUDIT_ERR_STATE (1) into the new AuditRecord::audit_last_error slot so a caller that got 0 back can disambiguate 'I misused the API' from 'the journal is down' via AuditClient::audit_last_error(). On the gate passing, (ENH-004) calls AuditRecord::audit_rearm() to clear the prior audit's per-audit content slots (record_exit_code / record_output_schema_ptr / record_output_hash) BEFORE allocating the new id — fixes a second audit in one process otherwise inheriting the first audit's stale content into its own INVOKE payload. audit_rearm is a pure .bss-only leaf touching only rax/r11, so rdi/rsi (op_name/op_args, still needed below) survive the call untouched without any push/pop. Lazy-init: if audit_id_next == 0 (the .bss zero start; reset() writes 1 but a consumer that skipped reset would still get a valid first id from this branch), write 1 into audit_id_next. Allocate id = audit_id_next, post-increment audit_id_next; store id in record_audit_id; store op_name / op_args in the record; write AUDIT_STATE_BEGUN (1) to record_state. M2-001 upgrade: after the state transition, call AuditBroker::audit_send_record(UEJ_KIND_TOOL_INVOKE=130) so the supervisor sees the tool starting. On send success (rax == AUDIT_OK) write AUDIT_OK into audit_last_error (ENH-006 — a caller polling audit_last_error after a successful begin sees 0, same as 'never failed'), reload record_audit_id into rax and return it. On send failure (ENH-006) capture audit_send_record's verbatim non-zero return (AUDIT_ERR_BROKER_UNAVAILABLE=3 or AUDIT_ERR_SEND_FAILED=4) into audit_last_error BEFORE zeroing rax for the 0 sentinel return — same 0 sentinel as the state-gate failure since both mean 'consumer must exit 3 per I4', but now a caller who wants the real cause can ask. record_state stays at BEGUN on send failure so post-mortem can walk the record; caller ignoring the 0 return and calling audit_record_output(0, ...) would fail the id gate with AUDIT_ERR_ID_MISMATCH. Effects widened from M1's !{mem} @{} to !{mem, sysreg} @{cap, sched} to match audit_send_record's tail (mem via user_bounce_send, sysreg via sched_wake, @{cap} for endpoint-cap consume, @{sched} for wake path). Every cross-module write uses `lea r11,[rip+sym]; mov [r11],reg` per the libpdx-argv parser.pdx pattern. Leaf function w.r.t. callee-saves — rdi/rsi captured into .bss before the send call so no push/pop needed for arg preservation; audit_send_record preserves rbx/r12..r15 by SysV. Register plan: rax = id/return/send-return, rcx = counter+state scratch (and, on the send-fail path, the audit_last_error write value copied from rax before rax is zeroed), r11 = LEA scratch, rdi = op_name (arg + audit_send_record's event_kind), rsi = op_args (arg). Immediates: 0 (state gate + AUDIT_OK compare), 1 (lazy-init + state transition + AUDIT_ERR_STATE), 130 (UEJ_KIND_TOOL_INVOKE) — all within the 0x7FFFFFFF cmp-imm constraint.",
+      justification: "libpdx-audit.M1-001 + M1-002 + M2-001 + ENH-004 + ENH-006 + #12: audit_begin entry point. Validates record_state == AUDIT_STATE_IDLE (0) via cmp reg, 0 (no test mnemonic per paideia-as conformance); on gate failure returns 0 to signal AUDIT_ERR_STATE, AND (ENH-006) writes AUDIT_ERR_STATE (1) into the new AuditRecord::audit_last_error slot so a caller that got 0 back can disambiguate 'I misused the API' from 'the journal is down' via AuditClient::audit_last_error(). On the gate passing, (ENH-004) calls AuditRecord::audit_rearm() to clear the prior audit's per-audit content slots (record_exit_code / record_output_schema_ptr / record_output_hash) BEFORE allocating the new id — fixes a second audit in one process otherwise inheriting the first audit's stale content into its own INVOKE payload. audit_rearm is a pure .bss-only leaf touching only rax/r11, so rdi/rsi (op_name/op_args) survive the call untouched without any push/pop. Immediately after, op_name/op_args are stored into record_op_name_ptr/record_op_args_ptr — moved here (ahead of id allocation) specifically for #12: the pid-fetch below issues a nested `call sys_getpid`, and since rdi/rsi are caller-save under SysV, they must already be safely in .bss before any such call, not held in registers across it. Lazy-init: if audit_id_next == 0 (the .bss zero start; reset() writes 1 but a consumer that skipped reset would still get a valid first id from this branch), write 1 into audit_id_next. Allocate local_id = audit_id_next, post-increment audit_id_next — identical to @0.1's allocation. #12: stash local_id in r14 (pushed with r15 as an alignment pair, both SysV callee-save) then lazily resolve AuditRecord::audit_process_pid (0 = not-yet-fetched sentinel; a real pid is never 0) via `call sys_getpid` (src/syscall_shim.pdx, SC+ ID 39) on only the first audit_begin call in a process, caching the result permanently. Compose the wire audit_id as `(pid << 32) | local_id` via `shl rax, 32; or rax, r14`, pop r14/r15, and store the COMPOSED value into record_audit_id — this is the #12 fix: every audit_id (and every parent_audit_id a child later inherits via audit_set_parent) is now globally unique across processes rather than merely unique within one, without any new kernel syscall (sys_getpid already exists at SC+ ID 39, effects `!{sysreg} @{}` — already covered by audit_begin's existing widened effect tail, so this signature does not change). Write AUDIT_STATE_BEGUN (1) to record_state. M2-001 upgrade: after the state transition, call AuditBroker::audit_send_record(UEJ_KIND_TOOL_INVOKE=130) so the supervisor sees the tool starting. On send success (rax == AUDIT_OK) write AUDIT_OK into audit_last_error (ENH-006 — a caller polling audit_last_error after a successful begin sees 0, same as 'never failed'), reload record_audit_id into rax and return it. On send failure (ENH-006) capture audit_send_record's verbatim non-zero return (AUDIT_ERR_BROKER_UNAVAILABLE=3 or AUDIT_ERR_SEND_FAILED=4) into audit_last_error BEFORE zeroing rax for the 0 sentinel return — same 0 sentinel as the state-gate failure since both mean 'consumer must exit 3 per I4', but now a caller who wants the real cause can ask. record_state stays at BEGUN on send failure so post-mortem can walk the record; caller ignoring the 0 return and calling audit_record_output(0, ...) would fail the id gate with AUDIT_ERR_ID_MISMATCH. Effects widened from M1's !{mem} @{} to !{mem, sysreg} @{cap, sched} to match audit_send_record's tail (mem via user_bounce_send, sysreg via sched_wake AND now sys_getpid's task_struct read, @{cap} for endpoint-cap consume, @{sched} for wake path) — #12's sys_getpid call needs only `{sysreg}`/`{}`, fully subsumed by this existing tail, so no widening was required for #12 itself. Every cross-module write uses `lea r11,[rip+sym]; mov [r11],reg` per the libpdx-argv parser.pdx pattern. Register plan: rax = id/pid/return/send-return, rcx = counter+state scratch (and, on the send-fail path, the audit_last_error write value copied from rax before rax is zeroed), r11 = LEA scratch, r14 = local_id held across sys_getpid (callee-save, pushed/popped with r15 for SysV alignment parity), rdi = op_name (arg, stored to .bss early) then event_kind arg to audit_send_record, rsi = op_args (arg, stored to .bss early). Immediates: 0 (state gate + AUDIT_OK compare + pid-cache-empty gate), 1 (lazy-init + state transition + AUDIT_ERR_STATE), 32 (pid shift width), 130 (UEJ_KIND_TOOL_INVOKE) — all within the 0x7FFFFFFF cmp-imm constraint.",
       block: {
         // ---- Gate 1: record_state must be IDLE (0) --------------------
         lea r11, [rip + record_state];
@@ -76,6 +99,17 @@ module AuditClient = structure {
         //      below) survive the call untouched.
         call audit_rearm;
 
+        // ---- Store op_name / op_args pointers now, while rdi/rsi still
+        //      hold the caller's arguments. #12 moves this earlier than
+        //      @0.1: the pid-fetch below issues a nested `call
+        //      sys_getpid`, and rdi/rsi are caller-save under SysV, so
+        //      they must be safely in .bss before any such call rather
+        //      than held across it. ----------------------------------
+        lea r11, [rip + record_op_name_ptr];
+        mov [r11], rdi;
+        lea r11, [rip + record_op_args_ptr];
+        mov [r11], rsi;
+
         // ---- Lazy-init audit_id_next to 1 if the caller skipped
         //      AuditRecord::reset() (defence-in-depth; reset() writes 1). -
         lea r11, [rip + audit_id_next];
@@ -87,23 +121,53 @@ module AuditClient = structure {
         mov [r11], rax;
 
       audit_begin_have_counter:
-        // ---- Allocate id: id = audit_id_next; audit_id_next += 1 -----
+        // ---- Allocate the LOCAL id: local_id = audit_id_next;
+        //      audit_id_next += 1 — identical to @0.1's allocation.
+        //      #12's fix is in HOW the wire audit_id is composed from
+        //      this value below, not in this allocation step.
         lea r11, [rip + audit_id_next];
-        mov rax, [r11];                          // rax = id to hand out
+        mov rax, [r11];                          // rax = local_id to hand out
         mov rcx, rax;
         add rcx, 1;
         lea r11, [rip + audit_id_next];
         mov [r11], rcx;                          // audit_id_next += 1
 
-        // ---- Store id into the in-progress record --------------------
-        lea r11, [rip + record_audit_id];
-        mov [r11], rax;                          // record_audit_id = id
+        // ---- #12: compose the globally-unique wire audit_id as
+        //      (pid << 32) | local_id. Stash local_id in r14 (SysV
+        //      callee-save; pushed with r15 as an alignment pair)
+        //      since the sys_getpid call below is caller-save-
+        //      clobbering and local_id must survive it.
+        push r14;
+        push r15;
+        mov r14, rax;                             // r14 = local_id
 
-        // ---- Store op_name / op_args pointers ------------------------
-        lea r11, [rip + record_op_name_ptr];
-        mov [r11], rdi;
-        lea r11, [rip + record_op_args_ptr];
-        mov [r11], rsi;
+        // ---- Lazy-init audit_process_pid (0 = "not yet fetched"; a
+        //      real pid is never 0 — paideia-os's process allocator is
+        //      1-based, see src/kernel/core/process/process.pdx).
+        //      Fetch once per process and cache — the pid cannot
+        //      change for the lifetime of this process, so no code
+        //      path (including reset()) ever re-clears this slot.
+        lea r11, [rip + audit_process_pid];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne audit_begin_have_pid;
+
+        call sys_getpid;                          // rax = pid (SC+ ID 39)
+        lea r11, [rip + audit_process_pid];
+        mov [r11], rax;
+
+      audit_begin_have_pid:
+        lea r11, [rip + audit_process_pid];
+        mov rax, [r11];                           // rax = pid
+        shl rax, 32;                              // rax = pid << 32
+        or  rax, r14;                             // rax = (pid << 32) | local_id
+
+        pop r15;
+        pop r14;
+
+        // ---- Store the composed id into the in-progress record -------
+        lea r11, [rip + record_audit_id];
+        mov [r11], rax;                           // record_audit_id = composed id
 
         // ---- Transition record_state IDLE -> BEGUN -------------------
         mov rcx, 1;                              // AUDIT_STATE_BEGUN

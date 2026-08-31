@@ -34,31 +34,50 @@
 # unlike libpdx-argv which mutates argv in place on `--foo=bar`.
 requires: KIND_IPC_ENDPOINT(write, svc.audit-journal) via svc_lookup
 
-# Declared output schemas — PdxAuditRecord@0.1 is the fixed 64-byte
-# / eight-u64-word record landed at M3-002 (grew from the M1 stub's
-# 56 bytes to carry parent_audit_id at index [7]; see
-# design/architecture.md §2). Every lifecycle send discriminates on
-# event_kind at index [1]: UEJ_KIND_TOOL_INVOKE (130), TOOL_OUTPUT
-# (132), TOOL_EXIT (133) — landed at M2-001 / M3-002, not merely
-# planned.
+# Declared output schemas — PdxAuditRecord@0.2 (libpdx-audit#11 + #12,
+# shipped as one coordinated wire revision; supersedes the M3-002
+# PdxAuditRecord@0.1 fixed 64-byte / eight-u64-word record). @0.2 is a
+# 256-byte hybrid record: five u64 numeric words (audit_id, event_kind,
+# exit_code, parent_audit_id, output_hash) at offsets 0/8/16/24/32,
+# followed by three fixed-size inline NUL-terminated string fields
+# (op_name[32], op_args[128], output_schema[32]) at offsets 40/72/200,
+# and 24 reserved bytes at offset 232 (see design/architecture.md §2
+# + §12.6). Two independent fixes landed together because both change
+# the record shape and both change AUDIT_HDR_WORD / AUDIT_PAYLOAD_BYTES:
+#
+#   * #11 — @0.1 sent record_op_name_ptr / record_op_args_ptr /
+#     record_output_schema_ptr verbatim: live VAs meaningful only in
+#     the SENDING process's address space, so the audit-journal daemon
+#     (a different process) received opaque integers where readable
+#     text belonged. @0.2 inlines the actual string bytes instead.
+#   * #12 — @0.1's record_audit_id was a bare per-process monotonic
+#     counter, so every tool's first audit had audit_id == 1 — the
+#     M3-002 parent-linkage feature broke the moment two sibling
+#     processes each opened their first audit. @0.2 composes
+#     audit_id as `(pid << 32) | local_id`, making it globally unique.
+#
+# Every lifecycle send discriminates on event_kind at offset 8:
+# UEJ_KIND_TOOL_INVOKE (130), TOOL_OUTPUT (132), TOOL_EXIT (133) —
+# landed at M2-001 / M3-002, unchanged by @0.2.
 declares_output_schemas:
-  - PdxAuditRecord@0.1
+  - PdxAuditRecord@0.2
 
-# Wire ownership — ENH-007. `svc.audit-journal` is a single shared
-# broker endpoint; every producer that sends to the cap slot resolved
-# by `sys_svc_lookup("svc.audit-journal")` MUST frame its payload with
-# AUDIT_HDR_WORD (0x0000_0040_0000_0120 — op 0x20 AUDIT_EVENT, ver 1,
-# reply_ep 0, payload_len 64) and MUST marshal the eight-u64
-# PdxAuditRecord@0.1 layout byte-for-byte (design/architecture.md §2).
-# There is no per-producer discriminator on this endpoint at R49 — a
-# second producer framing a different-shaped payload (e.g. a caller
-# with its own hand-rolled svc_lookup/ipc_send trampolines instead of
-# linking this library) puts an undecodable record on the wire the
-# moment a real audit-journal daemon body lands. libpdx-audit is the
-# **only** sanctioned producer implementation of this frame; any
-# consumer emitting audit events to this broker name must link this
-# library rather than reimplementing the wire format locally.
+# Wire ownership — ENH-007, updated for @0.2. `svc.audit-journal` is a
+# single shared broker endpoint; every producer that sends to the cap
+# slot resolved by `sys_svc_lookup("svc.audit-journal")` MUST frame its
+# payload with AUDIT_HDR_WORD (0x0000_0100_0000_0220 — op 0x20
+# AUDIT_EVENT, ver 2, reply_ep 0, payload_len 256) and MUST marshal the
+# 256-byte PdxAuditRecord@0.2 layout byte-for-byte (design/
+# architecture.md §2 + §12.6). There is no per-producer discriminator
+# on this endpoint at R49 — a second producer framing a different-
+# shaped payload (e.g. a caller with its own hand-rolled svc_lookup/
+# ipc_send trampolines instead of linking this library) puts an
+# undecodable record on the wire the moment a real audit-journal daemon
+# body lands. libpdx-audit is the **only** sanctioned producer
+# implementation of this frame; any consumer emitting audit events to
+# this broker name must link this library rather than reimplementing
+# the wire format locally.
 wire_ownership:
   endpoint: svc.audit-journal
   frame_header: AUDIT_HDR_WORD
-  record_schema: PdxAuditRecord@0.1
+  record_schema: PdxAuditRecord@0.2
