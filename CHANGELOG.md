@@ -5,8 +5,85 @@
 Source-verified audit pass against the four real consumers (`rm`,
 `cp`, `pkg`, `ls`) plus a caps/wire-declaration review; see
 `design/enhancement-plan.md`. Entries below track individual
-`ENH-*` issues as they land; a version bump + CHANGELOG rollup happens
-at the next formal release cut.
+`ENH-*` / `LA.M1-*` issues as they land; a version bump + CHANGELOG
+rollup happens at the next formal release cut.
+
+- **#20** `LA.M1-001` — `AuditBroker::audit_broker_bind` fast-path
+  reset-skipped bug. Pre-fix, `cmp rax, 0xFFFF; jne audit_bind_ok`
+  only re-entered the slow path on the explicit `UNRESOLVED`
+  sentinel written by `reset()`; a consumer that skipped `reset()`
+  hit the fast path against a `.bss`-zero `audit_broker_slot`,
+  returned `AUDIT_OK`, and every subsequent `audit_send_record`
+  then handed slot 0 (an arbitrary cap in the caller's cap_table)
+  to `sys_ipc_send` — the audit was silently misrouted with no
+  failure signal. New shape: two-compare range gate `[1..255]`
+  (0 from `.bss` or any value ≥ 256 forces the `sys_svc_lookup`
+  slow path), mirroring `audit_begin`'s lazy-init discipline for
+  `audit_id_next` at `src/audit_client.pdx:115-121`. No wire-
+  format change; no consumer-visible signature change.
+- **#21** `LA.M1-002` — namespaced test-driver entry points.
+  `TestBrokerRefusal::run` → `test_broker_refusal_run` and
+  `TestReplayGolden::run` → `test_replay_golden_run`. The bare
+  `run` linker symbol collided when a test runner linked both
+  drivers into a single binary; the namespaced names carry the
+  driver identity into the symbol table. External test-runner
+  invocations that referenced either `TestBrokerRefusal::run()`
+  or `TestReplayGolden::run()` (or the unqualified `run` linker
+  symbol) will need to use the new namespaced names — no downstream
+  test-harness consumer of the bare names exists yet (grep-verified
+  across the org), so this is a forward-compatible rename rather
+  than a live break; the library's own API surface is unchanged.
+- **#22** `LA.M1-003` — `audit_last_error` test parity. Added
+  subtests 11+12 to `tests/test_broker_refusal.pdx` (bringing the
+  driver to 12 subtests), fault-injecting the three real values
+  `audit_begin` writes to the slot (`AUDIT_ERR_STATE=1`,
+  `AUDIT_ERR_BROKER_UNAVAILABLE=3`, `AUDIT_ERR_SEND_FAILED=4`)
+  and verifying `AuditClient::audit_last_error()` round-trips
+  each verbatim, then verifying `reset()` clears the slot to
+  `AUDIT_OK`. Symmetric to the pre-existing ENH-008 subtests 9+10
+  for `audit_broker_failure_cause`. Pure `.bss` fault-injection;
+  no library-side change.
+- **#23** `LA.M1-004` — FNV-1a-64 known-vector correctness.
+  Added subtests 10+11 to `tests/test_replay_golden.pdx` (bringing
+  the driver to 11 subtests). Subtest 10 hashes `"foobar"`
+  (6 bytes) in one `audit_hash_update` call and asserts the
+  accumulator equals `0x85944171f73967e8` — the FNV author's
+  canonical reference vector (independently reproducible from the
+  spec: `offset_basis = 0xcbf29ce484222325`, `prime = 0x100000001b3`;
+  for each byte `b`, `h = (h ^ b) * prime` mod 2^64). Subtest 11
+  hashes `"foo"` then `"bar"` in two separate `audit_hash_update`
+  calls and asserts the same result, verifying the FNV-1a
+  incremental property (`record_hash_state` is correctly persisted
+  and reloaded across `audit_hash_update` calls). Pre-existing
+  subtest 2 covered only the empty-stream self-check
+  (`h_final(empty) = offset_basis`); the two new vectors close the
+  gap in byte-arithmetic correctness a wrong-prime or wrong-loop-
+  bound bug could otherwise slip through.
+- **#24** `LA.M1-005` — in-tree marshal harness. Two new files:
+  `tests/syscall_shim_stub.pdx` (a link-time replacement for
+  `src/syscall_shim.pdx` that captures `sys_ipc_send`'s
+  `(cap_slot, hdr, payload_ptr, payload_len)` into `.bss` slots +
+  returns success on `sys_svc_lookup` / `sys_getpid` / `sys_ipc_send`
+  — signatures byte-for-byte identical to the real trampolines) and
+  `tests/test_marshal_harness.pdx` (drives a full `reset()` →
+  `audit_broker_bind` → `audit_begin(mount, src=/dev/sda1 dst=/mnt)`
+  → `audit_record_output(PdxMountResult@0.1, 0xDEADBEEFCAFEBABE)` →
+  `audit_commit(0)` lifecycle then `memcmp`s the captured EXIT
+  payload against a hand-authored 256-byte @0.2 golden pattern —
+  audit_id `0x0000000700000001`, event_kind `0x85`, hash sentinel,
+  and the three inline string fields at their fixed offsets).
+  Exports `TestMarshalHarness::test_marshal_harness_run() -> u64`;
+  5 subtests, ordinal on first failure.
+
+  **Test-runner link-line concern (downstream)**: pdx has no Rust-
+  ish `#[cfg(test)]` gate — the runner build script MUST substitute
+  `tests/syscall_shim_stub.pdx` for `src/syscall_shim.pdx` when
+  building the `test_marshal_harness` binary (linking both files
+  fails with duplicate-symbol errors: a feature, not a bug). The
+  in-repo QEMU-matrix drivers (`test_broker_refusal`,
+  `test_replay_golden`) still link the real `syscall_shim.pdx` and
+  MUST NOT link the stub. This is a link-time discipline convention
+  documented in `tests/test_marshal_harness.pdx`'s module header.
 
 - **#11 + #12** `PdxAuditRecord@0.1 → @0.2` — coordinated wire
   revision (shipped together deliberately; see

@@ -1,0 +1,467 @@
+// tests/test_marshal_harness.pdx — libpdx-audit.LA.M1-005 (#24)
+// Driver for the in-tree marshal-correctness invariant: exercise the
+// full three-call AuditClient lifecycle (audit_begin ->
+// audit_record_output -> audit_commit) against tests/syscall_shim_stub.pdx
+// and verify AuditBroker::audit_send_record produces the exact @0.2
+// wire bytes the goldens contract (tests/goldens/trace_001.md)
+// specifies.
+//
+// Return convention (identical to the sibling drivers):
+//   0     — all subtests passed.
+//   1..N  — ordinal of first failing subtest.
+//
+// LINK-TIME CONCERN — flagged here since pdx has no Rust-ish
+// `#[cfg(test)]` gate:
+//
+//   The test-runner build line for THIS driver binary MUST substitute
+//   tests/syscall_shim_stub.pdx for src/syscall_shim.pdx — the stub
+//   exports the same three symbols (sys_svc_lookup, sys_ipc_send,
+//   sys_getpid) with byte-for-byte-identical signatures, so linking
+//   BOTH files produces duplicate-symbol errors (a feature: the
+//   runner author is forced to choose deliberately). A runner that
+//   links this driver alongside a real syscall_shim.pdx cannot
+//   satisfy the link, and a runner that links this driver alongside
+//   a driver that itself pulls in src/syscall_shim.pdx (e.g. a
+//   future in-QEMU harness) must isolate their binaries.
+//
+//   For the QEMU end-to-end matrix described in tests/README.md
+//   §QEMU smoke protocol, THIS driver is out of scope — the QEMU
+//   drivers link the REAL syscall_shim.pdx so their sys_ipc_send
+//   actually hits the audit-journal broker. This driver covers the
+//   marshal-side invariants that MUST hold before that broker sees
+//   any bytes; the QEMU matrix covers the broker-side receipt.
+//
+// Effects `!{mem, sysreg} @{cap, sched}` — the driver's own frame
+// is pure `.bss` (build the expected golden into
+// tmh_expected_payload, drive the three lifecycle calls, memcmp
+// captured against expected), but the driver calls audit_begin /
+// audit_record_output / audit_commit whose declared tails are
+// `!{mem, sysreg} @{cap, sched}` (each invokes AuditBroker::audit_
+// send_record → sys_ipc_send at every lifecycle point). The type-
+// checker inherits the widest callee tail regardless of whether
+// the syscall bodies actually fire under the stub link, so the
+// driver's own declared tail must be at least as wide. Sibling
+// drivers stay `!{mem} @{}` because they only call the pure-leaf
+// subset (reset / audit_can_emit_output / audit_hash_* /
+// audit_set_parent).
+//
+// Cross-module functions called (via the STUB link):
+//   AuditRecord::reset                (src/audit_record.pdx)
+//   AuditBroker::audit_broker_bind    (src/audit_broker.pdx, LA.M1-001)
+//   AuditClient::audit_begin          (src/audit_client.pdx)
+//   AuditClient::audit_record_output  (src/audit_client.pdx)
+//   AuditClient::audit_commit         (src/audit_client.pdx)
+// Cross-module .bss symbols READ (via the STUB link):
+//   SyscallShimStub::stub_captured_slot     (tests/syscall_shim_stub.pdx)
+//   SyscallShimStub::stub_captured_hdr      (tests/syscall_shim_stub.pdx)
+//   SyscallShimStub::stub_captured_payload  (tests/syscall_shim_stub.pdx)
+//   SyscallShimStub::stub_captured_len      (tests/syscall_shim_stub.pdx)
+
+module TestMarshalHarness = structure {
+
+  // ============================================================================
+  // Fixture strings for audit_begin / audit_record_output. All read-
+  // only NUL-terminated byte arrays; audit_marshal_string (see
+  // src/audit_broker.pdx) walks them until it hits the NUL or the
+  // per-field width cap, whichever comes first.
+  //
+  // op_name:  "mount\0"                     (6 bytes, fits AUDIT_OP_NAME_BYTES=32)
+  // op_args:  "src=/dev/sda1 dst=/mnt\0"    (23 bytes, fits AUDIT_OP_ARGS_BYTES=128)
+  // schema:   "PdxMountResult@0.1\0"        (19 bytes, fits AUDIT_OUTPUT_SCHEMA_BYTES=32)
+  //
+  // Chosen for the "kind=OP_MOUNT" flavour the LA.M1-005 issue names
+  // — the specific bytes are only load-bearing insofar as they must
+  // match the golden fixture below byte-for-byte.
+  // ============================================================================
+  pub let tmh_op_name : [u8; 6]  = "mount\0"
+  pub let tmh_op_args : [u8; 23] = "src=/dev/sda1 dst=/mnt\0"
+  pub let tmh_schema  : [u8; 19] = "PdxMountResult@0.1\0"
+
+  // ============================================================================
+  // Expected @0.2 EXIT-send payload — 256 bytes, hand-authored to
+  // match design/architecture.md §12.6 + tests/goldens/trace_001.md
+  // for the (pid=7, local_id=1, parent=0, exit=0, hash=SENTINEL)
+  // scenario the driver drives below. Populated at runtime by
+  // tmh_build_expected_payload (below) rather than a compile-time
+  // literal because paideia-as byte-array literals don't reliably
+  // encode non-ASCII bytes (the 0x85 event_kind byte, the negative-
+  // looking bytes of the output_hash sentinel, etc.) and building at
+  // runtime keeps every byte value visible in the source rather than
+  // buried in an escape sequence.
+  //
+  // Layout (matches audit_send_record's marshal sequence for an EXIT
+  // event; see design/architecture.md §12.6.3):
+  //   [  0..  8)  audit_id       = 0x0000000700000001  (pid 7 << 32 | 1)
+  //   [  8.. 16)  event_kind     = 0x85                (UEJ_KIND_TOOL_EXIT=133)
+  //   [ 16.. 24)  exit_code      = 0
+  //   [ 24.. 32)  parent_audit_id= 0                   (no audit_set_parent)
+  //   [ 32.. 40)  output_hash    = 0xDEADBEEFCAFEBABE  (test sentinel)
+  //   [ 40.. 72)  op_name        = "mount\0" + 26 zeros
+  //   [ 72..200)  op_args        = "src=/dev/sda1 dst=/mnt\0" + 105 zeros
+  //   [200..232)  output_schema  = "PdxMountResult@0.1\0" + 13 zeros
+  //   [232..256)  reserved       = 24 zeros
+  //
+  // .bss zero-init handles all trailing zero-pad regions and the 24
+  // reserved bytes at [232..256) without any store instruction.
+  // tmh_build_expected_payload only has to write the non-zero bytes:
+  //   - Five 8-byte numeric fields at offsets 0/8/16/24/32 via
+  //     `mov [scratch+off], reg`.
+  //   - Three byte-copy loops for the three inline string fields at
+  //     offsets 40/72/200.
+  // ============================================================================
+  pub let mut tmh_expected_payload : [u8; 256] = uninit @align(8)
+
+  // ============================================================================
+  // Stashed audit_id from audit_begin, used at the audit_record_output
+  // and audit_commit calls (both take audit_id as their first arg per
+  // the API — see src/audit_client.pdx).
+  // ============================================================================
+  pub let mut tmh_saved_audit_id : u64 = uninit @align(8)
+
+  // ============================================================================
+  // tmh_build_expected_payload() -> ()  [private]
+  //
+  // Populates tmh_expected_payload with the exact @0.2 EXIT-send byte
+  // pattern the driver expects to see in stub_captured_payload after
+  // audit_commit runs. Pure .bss writes; every byte the caller cares
+  // about is stored explicitly, everything else is left at .bss zero.
+  //
+  // The string-copy loops mirror audit_marshal_string's shape at
+  // src/audit_broker.pdx: byte-by-byte `xor rax,rax; mov_b rax,[src];
+  // mov_b [dst],rax; add src,1; add dst,1` with an early-terminate
+  // on source NUL — critically, they DO NOT pad the destination on
+  // early terminate (the .bss zero-init already provides the pad),
+  // and they DO NOT reserve a trailing zero byte in the destination
+  // (again, .bss zero-init provides it). This keeps the helper
+  // small — 3 numeric stores + 5 numeric stores + 3 copy-until-NUL
+  // loops — while producing byte-for-byte the same 256-byte
+  // pattern audit_marshal_string yields for these three inputs.
+  //
+  // Not `pub` — private setup helper, called once from
+  // test_marshal_harness_run at the top of the driver.
+  //
+  // Register plan:
+  //   rax = byte scratch + numeric write value + zero-fill scratch
+  //   rcx = src cursor for string copies (walks NUL-terminated array)
+  //   rdx = dst cursor for string copies (walks tmh_expected_payload
+  //         + field offset)
+  //   r11 = LEA scratch (paideia-as reserved)
+  // ============================================================================
+  let tmh_build_expected_payload : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.LA.M1-005 (#24): tmh_build_expected_payload private helper. Populates the .bss slot tmh_expected_payload with the exact @0.2 EXIT-send byte pattern the driver expects to see in SyscallShimStub::stub_captured_payload after audit_commit runs. Five numeric field writes at offsets 0/8/16/24/32 via `mov rax, imm64; lea r11, [rip+tmh_expected_payload]; mov [r11+off], rax` (the parser.pdx cross-module-write pattern; MOVABS for the two 64-bit sentinels 0x0000000700000001 and 0xDEADBEEFCAFEBABE, direct 32-bit imm for the three zero fields — though 0-writes could be omitted since .bss is zero-initialised, writing them explicitly makes the field layout visible in the source and forestalls a hypothetical future .bss reuse across driver runs from carrying stale values into a second run). Three inline string writes at offsets 40/72/200 via a private byte-copy pattern (xor rax,rax; mov_b rax,[rcx]; cmp rax,0; je next_field; mov_b [rdx],rax; add rcx,1; add rdx,1; jmp copy_loop) — early-terminate on source NUL means the destination bytes past the source string retain their .bss zero-init, which matches audit_marshal_string's own behaviour byte-for-byte (audit_marshal_string zero-pads through the field's end AND reserves the last byte as a guaranteed NUL; for the three source strings here (`mount\\0`, `src=/dev/sda1 dst=/mnt\\0`, `PdxMountResult@0.1\\0`) both approaches yield identical destination bytes because every source is strictly shorter than its field capacity minus one, so early-terminate + .bss-zero-pad and copy-until-max + explicit-zero-pad produce byte-identical results). The 24 reserved bytes at offset 232..256 are never written — .bss zero-init provides them, matching audit_send_record's own behaviour. Pure leaf — no callee-save touched, no push/pop, no nested call. Register plan: rax = byte/word scratch, rcx = src cursor, rdx = dst cursor, r11 = LEA scratch. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (zero fields + byte-zero + src-NUL compare), 1 (per-iteration cursor advance), 8/16/24/32 (numeric field offsets — all within 0x7FFFFFFF cmp-imm bound), 40/72/200 (string field offsets — within bound), 0xDEADBEEFCAFEBABE (output_hash sentinel — 64-bit, loaded via MOVABS into rax), 0x0000000700000001 (composed audit_id — 64-bit, MOVABS), 0x85 (event_kind UEJ_KIND_TOOL_EXIT — within cmp-imm bound). Label prefix tbep_ per project reserved-label discipline.",
+      block: {
+        // ---- Numeric fields (5 x u64) ------------------------------------
+
+        // Offset 0 — audit_id = 0x0000000700000001 (pid 7 << 32 | 1)
+        mov rax, 0x0000000700000001;
+        lea r11, [rip + tmh_expected_payload];
+        mov [r11 + 0], rax;
+
+        // Offset 8 — event_kind = 133 (UEJ_KIND_TOOL_EXIT, 0x85)
+        mov rax, 133;
+        lea r11, [rip + tmh_expected_payload];
+        mov [r11 + 8], rax;
+
+        // Offset 16 — exit_code = 0
+        xor rax, rax;
+        lea r11, [rip + tmh_expected_payload];
+        mov [r11 + 16], rax;
+
+        // Offset 24 — parent_audit_id = 0 (driver never calls audit_set_parent)
+        xor rax, rax;
+        lea r11, [rip + tmh_expected_payload];
+        mov [r11 + 24], rax;
+
+        // Offset 32 — output_hash = 0xDEADBEEFCAFEBABE (test sentinel)
+        mov rax, 0xDEADBEEFCAFEBABE;
+        lea r11, [rip + tmh_expected_payload];
+        mov [r11 + 32], rax;
+
+        // ---- String field at offset 40 — "mount\0" -----------------------
+        //      Copy until source NUL; .bss zero-init provides the pad
+        //      bytes through offset 72.
+        lea rcx, [rip + tmh_op_name];            // src cursor
+        lea r11, [rip + tmh_expected_payload];
+        mov rdx, r11;
+        add rdx, 40;                             // dst cursor at offset 40
+
+      tbep_name_copy:
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0;                              // source NUL ?
+        je  tbep_name_done;
+        mov_b [rdx], rax;
+        add rcx, 1;
+        add rdx, 1;
+        jmp tbep_name_copy;
+
+      tbep_name_done:
+        // ---- String field at offset 72 — "src=/dev/sda1 dst=/mnt\0" ------
+        lea rcx, [rip + tmh_op_args];
+        lea r11, [rip + tmh_expected_payload];
+        mov rdx, r11;
+        add rdx, 72;
+
+      tbep_args_copy:
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je  tbep_args_done;
+        mov_b [rdx], rax;
+        add rcx, 1;
+        add rdx, 1;
+        jmp tbep_args_copy;
+
+      tbep_args_done:
+        // ---- String field at offset 200 — "PdxMountResult@0.1\0" ---------
+        lea rcx, [rip + tmh_schema];
+        lea r11, [rip + tmh_expected_payload];
+        mov rdx, r11;
+        add rdx, 200;
+
+      tbep_schema_copy:
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je  tbep_schema_done;
+        mov_b [rdx], rax;
+        add rcx, 1;
+        add rdx, 1;
+        jmp tbep_schema_copy;
+
+      tbep_schema_done:
+        // Offsets 232..256 (24 reserved bytes) — untouched, .bss zero-init.
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // tmh_memcmp_256() -> u64  [private]
+  //
+  // Byte-by-byte compare of stub_captured_payload against
+  // tmh_expected_payload for 256 bytes. Returns 0 on match, or the
+  // 1-based byte offset of the first mismatch (1..256) on
+  // divergence. The 1-based offset is deliberate — a 0 return
+  // means match; a caller that needs the raw offset subtracts 1.
+  //
+  // Pure leaf; walks two cursors + a counter.
+  //
+  // Register plan:
+  //   rdi = src cursor (stub_captured_payload)
+  //   rsi = dst cursor (tmh_expected_payload)
+  //   rcx = byte counter (0..256)
+  //   rax = byte scratch + return value
+  //   r10 = expected byte scratch (second byte load per iter)
+  //   r11 = LEA scratch (paideia-as reserved)
+  // ============================================================================
+  let tmh_memcmp_256 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.LA.M1-005 (#24): tmh_memcmp_256 private helper. Byte-by-byte compare of SyscallShimStub::stub_captured_payload against TestMarshalHarness::tmh_expected_payload for exactly 256 bytes (AUDIT_PAYLOAD_BYTES); returns 0 on match, or the 1-based byte offset of the first divergence (1..256) on mismatch. Two cursors + a counter; loads one byte from each side per iteration via the paideia-as #1248 mitigation pattern (`xor rax, rax; mov_b rax, [rdi]; xor r10, r10; mov_b r10, [rsi]`), compares reg-to-reg via `cmp rax, r10`, and on inequality returns rcx+1 (1-based offset). Cursors walk via `add reg, 1` per iteration to sidestep the SIB-scale operand-parse bug (U1606), matching src/audit_broker.pdx's audit_marshal_string copy loop shape. Loop bound `cmp rcx, 256; jae tmh_memcmp_ok` uses unsigned compare (jae) — 256 is within the paideia-as cmp-imm 0x7FFFFFFF bound and encodes as a 32-bit sign-extended immediate. Pure leaf — no callee-save touched, no push/pop, no nested call; rdi/rsi/rcx/rax/r10 all caller-save so clobbering them without preservation is safe. Label prefix tmc_ per project reserved-label discipline. No test mnemonic; every check is cmp reg, reg or cmp reg, imm. Immediates: 0 (byte-zero pre-load + AUDIT_OK-equivalent return on match), 1 (per-iteration cursor + counter advance, plus the 1-based offset +1 on mismatch return), 256 (loop bound / AUDIT_PAYLOAD_BYTES) — all within cmp-imm bound.",
+      block: {
+        lea rdi, [rip + stub_captured_payload];  // src (captured)
+        lea rsi, [rip + tmh_expected_payload];   // dst (expected)
+        xor rcx, rcx;                            // byte counter
+
+      tmc_loop:
+        cmp rcx, 256;                            // AUDIT_PAYLOAD_BYTES
+        jae tmc_ok;
+
+        xor rax, rax;
+        mov_b rax, [rdi];                        // captured byte
+        xor r10, r10;
+        mov_b r10, [rsi];                        // expected byte
+        cmp rax, r10;
+        jne tmc_mismatch;
+
+        add rdi, 1;
+        add rsi, 1;
+        add rcx, 1;
+        jmp tmc_loop;
+
+      tmc_mismatch:
+        mov rax, rcx;
+        add rax, 1;                              // 1-based offset (1..256)
+        ret;
+
+      tmc_ok:
+        xor rax, rax;                            // match
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // test_marshal_harness_run() -> u64
+  //
+  // Sequential subtest driver:
+  //
+  //   1  audit_broker_bind returns AUDIT_OK (0) — the stub's
+  //      sys_svc_lookup returned slot 1, the slow-path result gate
+  //      accepted it, the cache was populated.
+  //   2  Post-commit stub_captured_slot == 1 — the slot the bind
+  //      cached round-tripped through audit_send_record and reached
+  //      sys_ipc_send's rdi.
+  //   3  stub_captured_len == 256 — audit_send_record wrote the
+  //      @0.2 AUDIT_PAYLOAD_BYTES.
+  //   4  stub_captured_hdr == 0x0000010000000220 — the AUDIT_HDR_WORD
+  //      value AuditRecord::AUDIT_HDR_WORD defines (op=0x20 |
+  //      ver=2 | reply_ep=0 | payload_len=256), dereferenced from
+  //      the caller's audit_hdr_scratch by the stub's *rsi load.
+  //   5  memcmp(stub_captured_payload, tmh_expected_payload, 256)
+  //      == 0 — every byte of the captured EXIT payload matches
+  //      the hand-authored @0.2 golden pattern for the (pid=7,
+  //      local_id=1, parent=0, exit=0, hash=DEADBEEFCAFEBABE)
+  //      driver scenario.
+  //
+  // Driver flow:
+  //   reset()                                                 [primes .bss]
+  //   tmh_build_expected_payload()                            [golden fixture]
+  //   audit_broker_bind()                                     [subtest 1]
+  //   audit_begin(&tmh_op_name, &tmh_op_args)                 [INVOKE send]
+  //   stash returned audit_id in tmh_saved_audit_id
+  //   audit_record_output(id, &tmh_schema, HASH_SENTINEL)     [OUTPUT send]
+  //   audit_commit(id, 0)                                     [EXIT send]
+  //   check subtests 2, 3, 4, 5 against stub_captured_*
+  //
+  // Only the EXIT send's captured state is checked — each
+  // sys_ipc_send call fully overwrites stub_captured_* (that is
+  // the point of the byte-copy in the stub), so the LAST send's
+  // state is what remains. Verifying the EXIT payload
+  // transitively verifies the marshal sequence (all three sends
+  // use the same audit_send_record; if EXIT is byte-correct, the
+  // marshal is byte-correct — INVOKE / OUTPUT differ only in the
+  // event_kind and the output_schema / output_hash contents,
+  // which are covered by their own subtests: subtest 4 verifies
+  // the header word (same across all three sends), subtest 5's
+  // memcmp verifies the payload byte-for-byte for EXIT).
+  //
+  // Register plan:
+  //   r12 = tmh_saved_audit_id staged across the three lifecycle
+  //         calls (SysV callee-save; every lifecycle callee
+  //         preserves r12)
+  //   r13 = alignment pair for r12's push/pop (unused; pushed for
+  //         SysV rsp % 16 == 0 discipline)
+  //   rax / rdi / rsi / rdx / rcx = per-call caller-save scratch
+  //   r11 = LEA scratch (paideia-as reserved)
+  //
+  // Effects `!{mem, sysreg} @{cap, sched}` — inherited from the
+  // widest callee (audit_begin / audit_record_output / audit_commit
+  // all declare `!{mem, sysreg} @{cap, sched}`). The stub link
+  // makes the syscall bodies pure `.bss` captures at runtime, but
+  // the type-checker inherits from the DECLARED tail regardless.
+  //
+  // Return: 0 on all-pass, 1..5 = ordinal of first failing subtest.
+  // ============================================================================
+  pub let test_marshal_harness_run : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "libpdx-audit.LA.M1-005 (#24): TestMarshalHarness::test_marshal_harness_run entry point. Namespaced per LA.M1-002 (#21) discipline (bare `run` would collide with sibling drivers at link time). Sequential subtest driver: five checks that together verify AuditBroker::audit_send_record produces the exact @0.2 wire bytes design/architecture.md §12.6 + tests/goldens/trace_001.md specify, using tests/syscall_shim_stub.pdx as the link-time replacement for src/syscall_shim.pdx (see this file's module header for the link-line discipline). Setup: reset() zeroes AuditRecord's .bss + primes audit_broker_slot=UNRESOLVED / audit_id_next=1. tmh_build_expected_payload() populates the golden fixture in tmh_expected_payload (256 bytes matching the (pid=7, local_id=1, parent=0, exit=0, hash=0xDEADBEEFCAFEBABE) EXIT-send scenario). Subtest 1: audit_broker_bind returns AUDIT_OK — the stub sys_svc_lookup returns 1 (a valid slot in [1..255]), audit_broker_bind's slow-path result gate accepts it, LA.M1-001 (#20) fast-path range gate on the second bind call (implicit via audit_send_record) accepts the cached 1 correctly. Subtest 2: after the three lifecycle calls, stub_captured_slot == 1 — the cached slot round-tripped through audit_send_record's `lea r11,[rip+audit_broker_slot]; mov rdi,[r11]` into sys_ipc_send's rdi at every send. Subtest 3: stub_captured_len == 256 — audit_send_record wrote AUDIT_PAYLOAD_BYTES (the @0.2 grown size, matches AuditRecord::AUDIT_PAYLOAD_BYTES=256). Subtest 4: stub_captured_hdr == 0x0000010000000220 — the AUDIT_HDR_WORD value (op=0x20 AUDIT_EVENT | ver=2 | reply_ep=0 | payload_len=256) audit_send_record writes into audit_hdr_scratch via `mov rax, 0x0000010000000220; lea r11,[rip+audit_hdr_scratch]; mov [r11],rax` and hands to sys_ipc_send via rsi (dereferenced by the stub's *rsi load). MOVABS for the reference constant since 0x0000010000000220 > 0x7FFFFFFF cmp-imm bound (encodes as a 40-bit immediate; the imm64 register load is fine, the compare is reg-to-reg via r10). Subtest 5: tmh_memcmp_256 == 0 — captured EXIT payload matches the hand-authored golden byte-for-byte; on divergence, the byte offset of the first mismatch (1..256) surfaces as the ordinal via a scaled return. Only the LAST send's state is checked — each sys_ipc_send call fully overwrites stub_captured_* (the byte-copy in the stub is why the driver can safely wait until after audit_commit to check); verifying EXIT transitively verifies the marshal sequence (INVOKE / OUTPUT / EXIT all use the same audit_send_record function — the only per-lifecycle-call variation is event_kind + record_output_hash + record_output_schema_ptr contents, all of which the EXIT payload reflects because record_output_hash / record_output_schema_ptr are set by audit_record_output before audit_commit runs). Driver flow: call reset (primes .bss); call tmh_build_expected_payload (golden fixture); call audit_broker_bind → check rax=0 (subtest 1); load `lea rdi,[rip+tmh_op_name]; lea rsi,[rip+tmh_op_args]`; call audit_begin → stash the returned composed audit_id (0x0000000700000001) in r12 + tmh_saved_audit_id; load `mov rdi, r12; lea rsi,[rip+tmh_schema]; mov rdx, 0xDEADBEEFCAFEBABE`; call audit_record_output; load `mov rdi, r12; xor rsi, rsi`; call audit_commit; then verify stub_captured_slot==1, stub_captured_len==256, stub_captured_hdr==AUDIT_HDR_WORD, and tmh_memcmp_256==0. Register plan: r12 = saved audit_id across the three lifecycle calls (SysV callee-save, preserved by every lifecycle callee including audit_send_record, audit_broker_bind, and the stubs); r13 = alignment pair (pushed with r12; unused). r14 is NOT pushed — audit_begin internally pushes/pops r14 as part of its #12 pid-composition, so the driver's own frame does not need to touch r14; the same applies to r15. Label prefix tmh_ per project reserved-label discipline. Return code: 0 on all-pass, 1..5 = ordinal of first failing subtest; on subtest 5 divergence, the return value is 5 (not the byte offset itself) to keep the ordinal convention clean — the ordinal identifies WHICH subtest failed; the byte offset is available at tmh_memcmp_256's own return if a downstream diagnostic wants it. No test mnemonic; every check is cmp reg, 0 or cmp reg, r10. Immediates: 0 (AUDIT_OK compare + exit_code + subtest-5 memcmp compare + parent gate not exercised), 1 (cap slot compare / subtest ordinals / cursor advance), 5 (final ordinal), 256 (payload length compare / AUDIT_PAYLOAD_BYTES), 0xDEADBEEFCAFEBABE (output_hash arg to audit_record_output — MOVABS), 0x0000010000000220 (AUDIT_HDR_WORD compare — MOVABS into r10, reg-to-reg cmp against rax). Effects `!{mem, sysreg} @{cap, sched}` — inherited from the widest callee (audit_begin / audit_record_output / audit_commit); the stub's syscall bodies are pure .bss captures + immediate returns at runtime, but the type-checker inherits from the DECLARED callee tail regardless of what the stub link actually does. Every callee preserves r12/r13 by SysV callee-save (audit_broker_bind's own frame saves nothing, audit_begin pushes r14/r15 pair, audit_record_output/audit_commit are similar). Test-runner substitution of tests/syscall_shim_stub.pdx for src/syscall_shim.pdx is a link-time discipline documented in this file's module header — the driver itself has no compile-time gate for the substitution.",
+      block: {
+        push r12;
+        push r13;
+
+        // ---- Setup: reset AuditRecord + build the golden fixture. --------
+        call reset;
+        call tmh_build_expected_payload;
+
+        // ---- Subtest 1: audit_broker_bind returns AUDIT_OK. --------------
+        call audit_broker_bind;
+        cmp rax, 0;                              // AUDIT_OK
+        jne tmh_fail_1;
+
+        // ---- Drive audit_begin(&tmh_op_name, &tmh_op_args). --------------
+        //      rax = composed audit_id ((pid=7 << 32) | local_id=1)
+        //      = 0x0000000700000001. Stash in r12 (SysV callee-save,
+        //      survives the two subsequent lifecycle calls) and in the
+        //      tmh_saved_audit_id .bss slot.
+        lea rdi, [rip + tmh_op_name];
+        lea rsi, [rip + tmh_op_args];
+        call audit_begin;
+
+        mov r12, rax;
+        lea r11, [rip + tmh_saved_audit_id];
+        mov [r11], rax;
+
+        // ---- Drive audit_record_output(id, schema, hash). ----------------
+        mov rdi, r12;
+        lea rsi, [rip + tmh_schema];
+        mov rdx, 0xDEADBEEFCAFEBABE;             // test sentinel
+        call audit_record_output;
+
+        // ---- Drive audit_commit(id, exit_code=0). ------------------------
+        mov rdi, r12;
+        xor rsi, rsi;                            // exit_code = 0
+        call audit_commit;
+
+        // ---- Subtest 2: captured slot round-tripped as 1. ----------------
+        lea r11, [rip + stub_captured_slot];
+        mov rax, [r11];
+        cmp rax, 1;                              // stub's fake slot
+        jne tmh_fail_2;
+
+        // ---- Subtest 3: captured payload_len == 256. ---------------------
+        lea r11, [rip + stub_captured_len];
+        mov rax, [r11];
+        cmp rax, 256;                            // AUDIT_PAYLOAD_BYTES
+        jne tmh_fail_3;
+
+        // ---- Subtest 4: captured hdr word == AUDIT_HDR_WORD. -------------
+        //      Stage reference constant in r10 via MOVABS since the
+        //      value exceeds the 32-bit cmp-imm bound; compare reg-to-
+        //      reg.
+        lea r11, [rip + stub_captured_hdr];
+        mov rax, [r11];
+        mov r10, 0x0000010000000220;             // AUDIT_HDR_WORD (@0.2)
+        cmp rax, r10;
+        jne tmh_fail_4;
+
+        // ---- Subtest 5: memcmp payload against golden. -------------------
+        //      tmh_memcmp_256 returns 0 on match or 1..256 on first-
+        //      mismatch byte offset. The ordinal here is 5 regardless
+        //      of WHICH byte diverged — the ordinal identifies the
+        //      subtest; a downstream diagnostic that wants the byte
+        //      offset calls tmh_memcmp_256 directly.
+        call tmh_memcmp_256;
+        cmp rax, 0;
+        jne tmh_fail_5;
+
+        // All subtests passed.
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        ret;
+
+      tmh_fail_1:
+        mov rax, 1;
+        pop r13;
+        pop r12;
+        ret;
+
+      tmh_fail_2:
+        mov rax, 2;
+        pop r13;
+        pop r12;
+        ret;
+
+      tmh_fail_3:
+        mov rax, 3;
+        pop r13;
+        pop r12;
+        ret;
+
+      tmh_fail_4:
+        mov rax, 4;
+        pop r13;
+        pop r12;
+        ret;
+
+      tmh_fail_5:
+        mov rax, 5;
+        pop r13;
+        pop r12;
+        ret;
+      }
+    }
+}

@@ -1,0 +1,237 @@
+// tests/syscall_shim_stub.pdx — libpdx-audit.LA.M1-005 (#24)
+// In-tree link-time replacement for src/syscall_shim.pdx: every
+// exported symbol here matches its src/syscall_shim.pdx counterpart
+// byte-for-byte in name, arity, effect tail, and capability tail, so
+// a test-runner link line can substitute this file for the real one
+// without touching any of the AuditClient / AuditBroker / AuditHash
+// call sites that reference these symbols by unqualified linker name.
+//
+// The stub captures the last-observed sys_ipc_send arguments into
+// four .bss slots — stub_captured_slot (rdi), stub_captured_hdr
+// (*rsi, i.e. the header word dereferenced through the caller-supplied
+// hdr pointer), stub_captured_payload[256] (a byte-copy of the
+// caller's payload buffer through rdx for exactly rcx bytes), and
+// stub_captured_len (rcx). tests/test_marshal_harness.pdx reads the
+// four slots after driving a full audit lifecycle (begin / record_
+// output / commit) to memcmp the captured EXIT payload against a
+// hand-authored @0.2 golden shape, verifying every offset written
+// by AuditBroker::audit_send_record's marshal sequence.
+//
+// The three trampoline symbols return values that keep the driver on
+// the success path:
+//   sys_svc_lookup  -> 1              (a valid cap slot in [0..255];
+//                                        1 rather than 0 so the LA.M1-
+//                                        001 (#20) fast-path range gate
+//                                        `[1..255]` sees the cached
+//                                        slot as valid on the second
+//                                        audit_broker_bind call)
+//   sys_ipc_send    -> 0              (SYS_IPC_SEND_OK — never
+//                                        triggers the M2-003 retry loop
+//                                        or the M2-002 sticky-flag
+//                                        failure epilogues)
+//   sys_getpid      -> 7              (a fake pid; feeds audit_begin's
+//                                        (pid << 32) | local_id
+//                                        composition — see design/
+//                                        architecture.md §12.6 for
+//                                        the #12 pid-namespacing
+//                                        rationale. 7 rather than 0
+//                                        because 0 is the audit_begin
+//                                        lazy-init sentinel meaning
+//                                        "not yet fetched"; 7 rather
+//                                        than 1 makes the composed
+//                                        audit_id visibly non-trivial
+//                                        in the golden byte pattern
+//                                        (0x0000000700000001 rather
+//                                        than 0x0000000100000001).
+//
+// Link-time convention (NOT a compile-time cfg): pdx has no Rust-ish
+// `#[cfg(test)]` gate, so the substitution is a discipline the test-
+// runner build script enforces by choosing which of {src/syscall_
+// shim.pdx, tests/syscall_shim_stub.pdx} to include in the link line
+// for a given driver binary. A driver linked with both files fails
+// at link time on duplicate-symbol errors — a feature, not a bug,
+// because it forces the runner author to choose deliberately.
+//
+// Effects/capabilities match the real syscall_shim.pdx exports so
+// the type-checker's effect-inference across every call site sees
+// the same tail whether the real or the stub link is in force.
+// The stub writes to its own .bss and does NOT actually invoke any
+// syscall, so the {sysreg} effect and the @{cap[, sched]}
+// capability tail are structurally not exercised — they are
+// declared solely for signature compatibility with the real
+// trampolines. This mirrors the discipline in libpdx-argv's own
+// argv_stub.pdx test double (referenced in tests/README.md's
+// "test-runner substitution" note).
+//
+// Cross-module symbols WRITTEN by this module:
+//   stub_captured_slot, stub_captured_hdr,
+//   stub_captured_payload[256], stub_captured_len
+
+module SyscallShimStub = structure {
+
+  // ============================================================================
+  // Capture .bss slots. All zero-initialised (.bss); a fresh
+  // AuditRecord::reset() at the top of the driver plus a re-run of
+  // audit_broker_bind / audit_begin / etc. produces a fresh capture
+  // sequence (each sys_ipc_send call fully overwrites all four
+  // slots + the 256 payload bytes it captures, so a second capture
+  // never inherits stale bytes from a first).
+  // ============================================================================
+  pub let mut stub_captured_slot    : u64       = uninit @align(8)
+  pub let mut stub_captured_hdr     : u64       = uninit @align(8)
+  pub let mut stub_captured_payload : [u8; 256] = uninit @align(8)
+  pub let mut stub_captured_len     : u64       = uninit @align(8)
+
+  // ============================================================================
+  // sys_svc_lookup(name_ptr, name_len) -> u64
+  //
+  // Real handler at src/syscall_shim.pdx resolves the name via SC+
+  // ID 43 and returns a cap slot in [0..255] or a negative-errno
+  // sentinel. Stub ignores its arguments and returns 1 — a valid
+  // cap slot that:
+  //   (a) is < 256, so audit_broker_bind's slow-path result gate
+  //       `cmp rax, 256; jae audit_bind_fail` treats it as a hit and
+  //       caches it into audit_broker_slot;
+  //   (b) is in [1..255], so the LA.M1-001 (#20) fast-path range gate
+  //       `cmp rax, 0; je needs_lookup; cmp rax, 256; jae
+  //       needs_lookup` sees the cached slot as valid on any
+  //       subsequent audit_broker_bind call in the same driver run.
+  //
+  // Signature MUST match src/syscall_shim.pdx:45 byte-for-byte:
+  //   effects !{mem, sysreg}, capabilities @{cap}, arity 2, u64
+  //   return. Real handler touches user memory + reads _current_tcb
+  //   + mints a cap slot; the stub touches none of that but
+  //   declares the same tail so the type-inference across
+  //   AuditBroker::audit_broker_bind's `call sys_svc_lookup` site
+  //   sees the identical effect signature.
+  //
+  // Leaf; no callee-save touched, no push/pop.
+  // ============================================================================
+  pub let sys_svc_lookup : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "libpdx-audit.LA.M1-005 (#24): SyscallShimStub::sys_svc_lookup test double. Returns a fixed valid cap slot (1) via `mov rax, 1; ret` so AuditBroker::audit_broker_bind's slow-path result gate `cmp rax, 256; jae audit_bind_fail` treats it as a hit and caches it, AND the LA.M1-001 (#20) fast-path range gate `[1..255]` sees the cached slot as valid on subsequent bind calls. Returns 1 rather than 0 specifically because slot 0 is now treated as `unresolved` by the LA.M1-001 fast-path gate (mirror of audit_begin's lazy-init discipline). Arguments (name_ptr in rdi, name_len in rsi) are ignored — the stub does not verify the caller passed the correct broker name; that verification is out of scope for the marshal-harness test which is only concerned with the WIRE payload marshalling correctness, not the bind-side name-resolution correctness (M4-001 covers the bind-refusal path via .bss fault injection in tests/test_broker_refusal.pdx). Signature MUST match src/syscall_shim.pdx:45 byte-for-byte (effects !{mem, sysreg}, capabilities @{cap}, arity 2, u64 return) so the AuditBroker::audit_broker_bind call site sees the identical effect signature under either link. Leaf; no callee-save touched, no push/pop, no memory or syscall actually executed. Immediates: 1 (return value) — within paideia-as cmp-imm bound (though never compared, only loaded).",
+      block: {
+        mov rax, 1;                              // fake cap slot (valid in [1..255])
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // sys_ipc_send(cap_slot, user_hdr_va, user_payload_va, payload_len)
+  //
+  // Real handler at src/syscall_shim.pdx invokes SC+ ID 42 (arity-4
+  // syscall requiring the rcx -> r10 shuffle). Stub captures every
+  // argument into .bss and returns 0 (SYS_IPC_SEND_OK).
+  //
+  // Capture sequence:
+  //   1. stub_captured_slot = rdi  (cap_slot)
+  //   2. stub_captured_hdr  = [rsi] (dereference user_hdr_va to get
+  //                                   the 8-byte packed header word)
+  //   3. stub_captured_len  = rcx  (payload_len)
+  //   4. copy rcx bytes from rdx to stub_captured_payload, byte-by-
+  //      byte, walking two cursors with `add rdi_dst, 1; add rsi_src,
+  //      1` per iteration — matches audit_marshal_string's copy loop
+  //      shape at src/audit_broker.pdx (paideia-as #1248 mitigation:
+  //      xor rax, rax; mov_b rax, [src]; mov_b [dst], rax).
+  //
+  // The byte-copy step is load-bearing: user_payload_va (rdx) is a
+  // pointer into AuditRecord::audit_payload_scratch — a .bss buffer
+  // AuditBroker::audit_send_record overwrites at every send, so
+  // capturing the pointer alone would leave the driver comparing the
+  // scratch buffer to itself after a subsequent send clobbers it.
+  //
+  // Signature MUST match src/syscall_shim.pdx:65 byte-for-byte:
+  //   effects !{mem, sysreg}, capabilities @{cap, sched}, arity 4,
+  //   u64 return. The `@{sched}` capability the real handler needs
+  //   (for sched_wake) is not exercised by the stub but is declared
+  //   so AuditBroker::audit_send_record's `call sys_ipc_send` site
+  //   sees the identical effect signature.
+  //
+  // Register plan (leaf w.r.t. nested calls — the byte-copy loop is
+  // inline, no nested call, no callee-save preservation needed):
+  //   rdi = cap_slot        (arg, captured then free)
+  //   rsi = user_hdr_va     (arg, dereferenced then free)
+  //   rdx = payload_va      (arg, walked as src cursor)
+  //   rcx = payload_len     (arg, captured then used as loop bound)
+  //   r8  = dst cursor      (walks stub_captured_payload)
+  //   r9  = byte count      (0..rcx)
+  //   rax = byte scratch + return
+  //   r11 = LEA scratch     (paideia-as reserved)
+  // ============================================================================
+  pub let sys_ipc_send : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (cap_slot: u64) (user_hdr_va: u64) (user_payload_va: u64) (payload_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "libpdx-audit.LA.M1-005 (#24): SyscallShimStub::sys_ipc_send test double. Captures each of the four SysV arguments into .bss (stub_captured_slot from rdi, stub_captured_hdr from *rsi, stub_captured_len from rcx, and stub_captured_payload as a byte-by-byte copy of rcx bytes at rdx) then returns 0 (SYS_IPC_SEND_OK) so the caller stays on the success path — never triggers M2-003's retry-on-EAGAIN loop or M2-002's sticky-flag failure epilogue. The byte-copy is load-bearing: user_payload_va points into AuditRecord::audit_payload_scratch, a .bss buffer AuditBroker::audit_send_record overwrites at each send, so capturing the pointer alone would leave a downstream memcmp comparing the scratch buffer to itself after a subsequent send clobbers it. Capture sequence: (1) mov [stub_captured_slot], rdi. (2) Load 8-byte header word via `mov rax, [rsi]; mov [stub_captured_hdr], rax` — the caller's rsi is a live u64 pointer (AuditRecord::audit_hdr_scratch) inside audit_send_record. (3) mov [stub_captured_len], rcx. (4) Byte-copy loop: `xor r9, r9; sisc_copy_loop: cmp r9, rcx; jae sisc_done; xor rax, rax; mov_b rax, [rdx]; mov_b [r8], rax; add rdx, 1; add r8, 1; add r9, 1; jmp sisc_copy_loop; sisc_done: xor rax, rax; ret`. Byte load/store uses the paideia-as #1248 mitigation (mov_b does not zero-extend on its own so a preceding `xor rax, rax` is required for the byte load). Cursors walk via `add reg, 1` per iteration rather than indexed addressing to sidestep the SIB-scale operand-parse bug (U1606) that requires an explicit `*1` scale on indexed byte loads — matches src/audit_broker.pdx's audit_marshal_string copy loop shape byte-for-byte. Loop bound `cmp r9, rcx; jae` uses unsigned compare (jae) — safe because rcx is a byte count and audit_send_record always passes 256 (AUDIT_PAYLOAD_BYTES), never a negative value. Signature MUST match src/syscall_shim.pdx:65 byte-for-byte (effects !{mem, sysreg}, capabilities @{cap, sched}, arity 4, u64 return) so AuditBroker::audit_send_record's call site sees the identical effect signature under either link. Leaf w.r.t. nested calls — the byte-copy is inline so no callee-save preservation is needed; rdi/rsi/rdx/rcx are all caller-save and consumed during capture; r8/r9 are caller-save under SysV so clobbering them without push/pop is safe. Label prefix sisc_ per project reserved-label discipline. No test mnemonic; the loop bound is cmp reg, reg (jae). Immediates: 0 (byte-zero for mov_b zero-extend + AUDIT_OK return), 1 (per-iteration cursor advance) — within paideia-as cmp-imm bound.",
+      block: {
+        // ---- Capture slot (rdi) into .bss --------------------------------
+        lea r11, [rip + stub_captured_slot];
+        mov [r11], rdi;
+
+        // ---- Capture header word (*rsi) into .bss ------------------------
+        mov rax, [rsi];
+        lea r11, [rip + stub_captured_hdr];
+        mov [r11], rax;
+
+        // ---- Capture payload length (rcx) into .bss ----------------------
+        lea r11, [rip + stub_captured_len];
+        mov [r11], rcx;
+
+        // ---- Byte-copy rcx bytes from rdx into stub_captured_payload -----
+        //      Cursors walked via `add reg, 1` per iteration rather than
+        //      an indexed `[base + idx*1]` form — sidesteps the SIB-scale
+        //      operand-parse bug (U1606) that would otherwise force an
+        //      explicit `*1` scale on the indexed byte load. Matches
+        //      src/audit_broker.pdx's audit_marshal_string copy loop
+        //      byte-for-byte.
+        lea r8, [rip + stub_captured_payload];   // dst cursor
+        xor r9, r9;                              // byte count = 0
+
+      sisc_copy_loop:
+        cmp r9, rcx;
+        jae sisc_done;
+
+        xor rax, rax;                            // paideia-as #1248 pre-zero
+        mov_b rax, [rdx];                        // load one src byte
+        mov_b [r8], rax;                         // store to dst
+
+        add rdx, 1;                              // advance src cursor
+        add r8, 1;                               // advance dst cursor
+        add r9, 1;                               // advance byte count
+        jmp sisc_copy_loop;
+
+      sisc_done:
+        xor rax, rax;                            // SYS_IPC_SEND_OK
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // sys_getpid() -> u64
+  //
+  // Real handler at src/syscall_shim.pdx invokes SC+ ID 39. Stub
+  // returns a fixed fake pid (7) so AuditClient::audit_begin's #12
+  // pid-cache lazy-init sees a valid non-zero value.
+  //
+  // 7 rather than 0 — 0 is audit_begin's "not yet fetched" sentinel;
+  // caching 0 would re-invoke sys_getpid on every audit_begin call.
+  // 7 rather than 1 — makes the composed audit_id in the golden byte
+  // pattern (0x0000000700000001) visibly non-trivial rather than
+  // colliding with local_id 1 (which would yield 0x0000000100000001,
+  // reading the wrong nibbles as a decoder debug output).
+  //
+  // Signature MUST match src/syscall_shim.pdx:86 byte-for-byte:
+  //   effects !{sysreg}, capabilities @{}, arity 0, u64 return.
+  //
+  // Leaf; no callee-save touched, no push/pop.
+  // ============================================================================
+  pub let sys_getpid : () -> u64 !{sysreg} @{} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-audit.LA.M1-005 (#24): SyscallShimStub::sys_getpid test double. Returns a fixed fake pid (7) via `mov rax, 7; ret` so AuditClient::audit_begin's #12 pid-cache lazy-init (src/audit_client.pdx:150-157) sees a valid non-zero value on its first call and caches it. Returns 7 rather than 0 because 0 is audit_begin's `not yet fetched` sentinel — caching 0 would defeat the cache and re-invoke sys_getpid on every audit_begin call. Returns 7 rather than 1 so the wire audit_id composition `(pid << 32) | local_id` yields 0x0000000700000001 rather than 0x0000000100000001 — a visibly non-trivial audit_id in the golden byte pattern that a decoder debugging pass will not mistakenly read as `local_id repeated`. Signature MUST match src/syscall_shim.pdx:86 byte-for-byte (effects !{sysreg}, capabilities @{}, arity 0, u64 return). Leaf; no callee-save touched, no push/pop, no actual syscall executed. Immediate: 7 (return value) — within paideia-as cmp-imm bound (though never compared, only loaded).",
+      block: {
+        mov rax, 7;                              // fake pid (visibly non-trivial)
+        ret;
+      }
+    }
+}

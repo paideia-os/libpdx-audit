@@ -1,4 +1,4 @@
-// tests/test_replay_golden.pdx — libpdx-audit.M4-002 + ENH-004
+// tests/test_replay_golden.pdx — libpdx-audit.M4-002 + ENH-004 + LA.M1-002 (#21) + LA.M1-004 (#23)
 // Driver for the "audit-journal replay correctness against a known
 // trace" invariant. Verifies the library-observable pieces of the
 // wire-format contract that a supervisor replaying the audit journal
@@ -61,10 +61,47 @@ module TestReplayGolden = structure {
   pub let mut trg_null_scratch : u64 = uninit @align(8)
 
   // ============================================================================
-  // run() -> u64
+  // LA.M1-004 (#23) FNV-1a-64 known-vector fixtures. Byte arrays fed
+  // through AuditHash::audit_hash_update; the accumulator is compared
+  // against independently-computable reference values.
   //
-  // Executes the M4-002 + ENH-004 subtest sequence in order. Returns 0
-  // on all-pass or the ordinal of the first failing subtest (1..9).
+  // Reference vectors are the FNV author's canonical fnvtest.c set,
+  // reproducible from the FNV-1a-64 specification:
+  //   offset_basis = 0xcbf29ce484222325
+  //   prime        = 0x100000001b3
+  //   for each byte b: h = (h ^ b) * prime   (mod 2^64)
+  //
+  // "foobar" (6 bytes, ASCII) hashes to 0x85944171f73967e8 — the
+  // reference vector cited in the FNV author's test suite at
+  // http://www.isthe.com/chongo/tech/comp/fnv/ (row 10 of the
+  // fnv1a-64 vector table). Second vector: subtest 11 verifies the
+  // FNV-1a-64 incremental property by folding the same bytes in
+  // chunks ("foo" then "bar") and expecting the same accumulator
+  // value — a stronger check than a second hand-computed hash
+  // because a wrong loop bound in audit_hash_update would still
+  // agree with itself against a hand-computed value while breaking
+  // the incremental property. Together they cover both single-call
+  // correctness and multi-call state-persistence correctness
+  // (each update advances record_hash_state; audit_hash_finalize
+  // reads the accumulated state one final time). The strings live
+  // in the read-only `pub let` form so audit_hash_update can walk
+  // them via `xor rax,rax; mov_b rax,[rsi]` per the paideia-as
+  // #1248 byte-load discipline.
+  // ============================================================================
+  pub let trg_fnv_foobar : [u8; 6] = "foobar"
+  pub let trg_fnv_foo    : [u8; 3] = "foo"
+  pub let trg_fnv_bar    : [u8; 3] = "bar"
+
+  // ============================================================================
+  // test_replay_golden_run() -> u64
+  //
+  // Executes the M4-002 + ENH-004 + LA.M1-004 subtest sequence in order.
+  // Returns 0 on all-pass or the ordinal of the first failing subtest
+  // (1..11). LA.M1-002 (#21) renamed the entry point from the bare `run`
+  // to the namespaced `test_replay_golden_run` — external test runners
+  // that referenced `TestReplayGolden::run()` (or the unqualified linker
+  // symbol `run`) must migrate to
+  // `TestReplayGolden::test_replay_golden_run()`.
   //
   // Subtest ledger:
   //
@@ -97,6 +134,19 @@ module TestReplayGolden = structure {
   //      baseline values, call audit_rearm(), then verify the three
   //      content slots read back 0 and the three preserved slots
   //      still hold their fault-injected values.
+  //  10  (LA.M1-004 / #23) FNV-1a-64 known vector: hash "foobar"
+  //      (6 bytes) in one update() call and assert the accumulator
+  //      equals 0x85944171f73967e8 — the FNV author's canonical
+  //      reference vector (fnvtest.c row 10; reproducible from the
+  //      spec: offset_basis 0xcbf29ce484222325, prime 0x100000001b3,
+  //      for each byte b: h = (h ^ b) * prime, mod 2^64).
+  //  11  (LA.M1-004 / #23) FNV-1a-64 incremental property: hash
+  //      "foo" then "bar" in two separate update() calls and assert
+  //      the accumulator equals the same 0x85944171f73967e8 —
+  //      proves audit_hash_update correctly persists
+  //      record_hash_state across calls, catches a hypothetical
+  //      accumulator-reload bug that a single-call vector would
+  //      miss.
   //
   // Register plan (leaf; two calls that take args need arg preservation
   // across ONE call each — no state shared between call sites):
@@ -111,10 +161,10 @@ module TestReplayGolden = structure {
   // MOVABS into r13 then compared reg-to-reg — a valid encoding path.
   // ============================================================================
 
-  pub let run : () -> u64 !{mem} @{} =
+  pub let test_replay_golden_run : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M4-002 + ENH-004: TestReplayGolden::run entry point. Sequential subtest driver: nine .bss-and-API-only checks covering the state-machine reset invariant, the FNV-1a-64 empty-stream self-check (M3-001 known-vector: h_final(empty) = FNV_OFFSET_BASIS 0xcbf29ce484222325 — matches the RFC-style FNV spec exactly and requires no byte arithmetic to verify), the hash active-flag gates (subtests 3+4), the len=0 no-op path (subtests 5+6), the parent-linkage state-gate contract (subtests 7+8), and the ENH-004 audit_rearm selective-clear invariant (subtest 9). Subtest 4 relies on the M3-001 defence-in-depth invariant: calling audit_hash_update without a prior audit_hash_init returns AUDIT_ERR_HASH_INACTIVE=5 rather than silently folding bytes into the .bss zero baseline. Subtest 7 exercises the M3-002 audit_set_parent → record_parent_audit_id propagation directly; the .bss slot is what AuditBroker::audit_send_record marshals into payload index [7] on every INVOKE/OUTPUT/EXIT, so verifying it holds the caller-passed value proves the wire-format handoff. Subtest 8 verifies the IDLE gate on audit_set_parent (record_state != IDLE → AUDIT_ERR_STATE) — parent linkage is a property of the audit's identity per design/architecture.md §12.1. Subtest 9 fault-injects all six slots audit_rearm touches or must NOT touch (record_exit_code=0xAA, record_output_schema_ptr=0xBB, record_output_hash=0xCC, audit_id_next=5, audit_broker_slot=7, audit_broker_failed=1), calls audit_rearm, then verifies the three content slots read back 0 while the three process-scoped slots are unchanged — proving the ENH-004 fix (a second audit_begin no longer inherits a prior audit's stale exit_code/schema/hash) without regressing monotonic id allocation, the broker bind cache, or the ENH-008-owned sticky-failure flag. FNV_OFFSET_BASIS staged in r13 via MOVABS since 0xcbf29ce484222325 > 0x7FFFFFFF cmp-imm bound; reg-to-reg compare via `cmp rax, r13`. Fault-injection for subtest 8 writes 1 (AUDIT_STATE_BEGUN) into record_state via `lea r11,[rip+record_state]; mov [r11],rax` (parser.pdx cross-module-write pattern) — bypassing audit_begin lets the driver test audit_set_parent's gate without invoking the sys_ipc_send that audit_begin would trigger. Every callee here is a pure leaf (reset, audit_hash_init/update/finalize, audit_set_parent, audit_rearm all declared !{mem} @{}) so no register state needs preservation beyond r12/r13 (pushed as a pair for SysV callee-save + rsp % 16 alignment). Label prefix trg_ per project reserved-label discipline. Return code: 0 on all-pass, 1..9 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (state IDLE / AUDIT_OK / .bss zero), 1 (state BEGUN / AUDIT_ERR_STATE fault-inject value / audit_broker_failed fault value), 2..9 (subtest ordinals), 5 (AUDIT_ERR_HASH_INACTIVE / audit_id_next fault value), 7 (audit_broker_slot fault value), 0x1234567 (parent-id sentinel — 25-bit value, well within 0x7FFFFFFF cmp-imm bound and encodable as MOVABS or 32-bit imm for the .bss write), 0xAA/0xBB/0xCC (subtest 9 fault-inject values, all 8-bit-safe 32-bit immediates). FNV_OFFSET_BASIS (0xcbf29ce484222325) is 64-bit — loaded via MOVABS into r13 and used only in reg-to-reg cmp. All within paideia-as encoding gates.",
+      justification: "libpdx-audit.M4-002 + ENH-004 + LA.M1-002 (#21) + LA.M1-004 (#23): TestReplayGolden::test_replay_golden_run entry point (renamed from the pre-LA.M1-002 bare `run` per #21 for the same test-runner symbol-collision reason test_broker_refusal_run was renamed). Sequential subtest driver: eleven .bss-and-API-only checks covering the state-machine reset invariant, the FNV-1a-64 empty-stream self-check (M3-001 known-vector: h_final(empty) = FNV_OFFSET_BASIS 0xcbf29ce484222325 — matches the RFC-style FNV spec exactly and requires no byte arithmetic to verify), the hash active-flag gates (subtests 3+4), the len=0 no-op path (subtests 5+6), the parent-linkage state-gate contract (subtests 7+8), the ENH-004 audit_rearm selective-clear invariant (subtest 9), and (LA.M1-004 / #23) two new FNV-1a-64 correctness subtests — subtest 10 hashes 'foobar' (6 bytes) in one update() call and asserts the accumulator equals the FNV author's canonical reference vector 0x85944171f73967e8 (independently reproducible from the spec: for each byte b, h = (h ^ b) * FNV_PRIME, mod 2^64), subtest 11 hashes 'foo' then 'bar' in two separate update() calls and asserts the same result, verifying the incremental property (a wrong per-iteration state persist/reload in audit_hash_update would still agree with itself against a hand-computed single-shot hash but would break this equality). Together the two vectors cover single-call correctness AND multi-call state-persistence correctness that neither vector alone catches. Subtest 4 relies on the M3-001 defence-in-depth invariant: calling audit_hash_update without a prior audit_hash_init returns AUDIT_ERR_HASH_INACTIVE=5 rather than silently folding bytes into the .bss zero baseline. Subtest 7 exercises the M3-002 audit_set_parent → record_parent_audit_id propagation directly; the .bss slot is what AuditBroker::audit_send_record marshals into payload offset 24 on every INVOKE/OUTPUT/EXIT, so verifying it holds the caller-passed value proves the wire-format handoff. Subtest 8 verifies the IDLE gate on audit_set_parent (record_state != IDLE → AUDIT_ERR_STATE) — parent linkage is a property of the audit's identity per design/architecture.md §12.1. Subtest 9 fault-injects all six slots audit_rearm touches or must NOT touch (record_exit_code=0xAA, record_output_schema_ptr=0xBB, record_output_hash=0xCC, audit_id_next=5, audit_broker_slot=7, audit_broker_failed=1), calls audit_rearm, then verifies the three content slots read back 0 while the three process-scoped slots are unchanged — proving the ENH-004 fix (a second audit_begin no longer inherits a prior audit's stale exit_code/schema/hash) without regressing monotonic id allocation, the broker bind cache, or the ENH-008-owned sticky-failure flag. FNV_OFFSET_BASIS staged in r13 via MOVABS since 0xcbf29ce484222325 > 0x7FFFFFFF cmp-imm bound; reg-to-reg compare via `cmp rax, r13`. LA.M1-004 subtests 10+11 stage the reference vector 0x85944171f73967e8 in r13 via MOVABS for the same reason (0x8594... exceeds the 32-bit sign-extended imm range for cmp reg, imm). Fault-injection for subtest 8 writes 1 (AUDIT_STATE_BEGUN) into record_state via `lea r11,[rip+record_state]; mov [r11],rax` (parser.pdx cross-module-write pattern) — bypassing audit_begin lets the driver test audit_set_parent's gate without invoking the sys_ipc_send that audit_begin would trigger. Every callee here is a pure leaf (reset, audit_hash_init/update/finalize, audit_set_parent, audit_rearm all declared !{mem} @{}) so no register state needs preservation beyond r12/r13 (pushed as a pair for SysV callee-save + rsp % 16 alignment). Label prefix trg_ per project reserved-label discipline. Return code: 0 on all-pass, 1..11 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (state IDLE / AUDIT_OK / .bss zero), 1 (state BEGUN / AUDIT_ERR_STATE fault-inject value / audit_broker_failed fault value), 2..11 (subtest ordinals), 3 (byte count for `foo`/`bar` fixtures at subtest 11), 5 (AUDIT_ERR_HASH_INACTIVE / audit_id_next fault value), 6 (byte count for `foobar` fixture at subtest 10), 7 (audit_broker_slot fault value), 0x1234567 (parent-id sentinel — 25-bit value, well within 0x7FFFFFFF cmp-imm bound and encodable as MOVABS or 32-bit imm for the .bss write), 0xAA/0xBB/0xCC (subtest 9 fault-inject values, all 8-bit-safe 32-bit immediates). FNV_OFFSET_BASIS (0xcbf29ce484222325) and the LA.M1-004 reference vector 0x85944171f73967e8 are both 64-bit — loaded via MOVABS into r13 and used only in reg-to-reg cmp. All within paideia-as encoding gates.",
       block: {
         push r12;
         push r13;
@@ -265,6 +315,60 @@ module TestReplayGolden = structure {
         // Restore clean state for a subsequent driver run.
         call reset;
 
+        // ---- Subtest 10 (LA.M1-004 / #23): FNV-1a-64 known vector for
+        //      "foobar" (6 bytes) — expect 0x85944171f73967e8. Reference
+        //      vector from the FNV author's canonical fnvtest.c set
+        //      (row 10 of the fnv1a-64 vector table at
+        //      http://www.isthe.com/chongo/tech/comp/fnv/). Independently
+        //      reproducible by hand-application of the spec:
+        //        h = FNV_OFFSET_BASIS (0xcbf29ce484222325)
+        //        for each byte b in "foobar":
+        //            h = (h ^ b) * FNV_PRIME (0x100000001b3)   mod 2^64
+        //      Reload r13 with the reference vector (r13 previously held
+        //      FNV_OFFSET_BASIS for subtests 2+6; MOVABS reload is
+        //      required since 0x8594... exceeds the 32-bit cmp-imm
+        //      bound). Compare rax to r13 via reg-to-reg cmp.
+        call audit_hash_init;
+        lea rdi, [rip + trg_fnv_foobar];
+        mov rsi, 6;                               // byte count
+        call audit_hash_update;
+        cmp rax, 0;                               // AUDIT_OK ?
+        jne trg_fail_10;
+
+        call audit_hash_finalize;
+        mov r13, 0x85944171f73967e8;              // FNV-1a-64("foobar")
+        cmp rax, r13;
+        jne trg_fail_10;
+
+        // ---- Subtest 11 (LA.M1-004 / #23): FNV-1a-64 incremental
+        //      property — hashing "foo" then "bar" in two separate
+        //      update() calls MUST produce the same accumulator value
+        //      as hashing "foobar" in one call, because FNV-1a's per-
+        //      byte fold has no cross-byte carry and audit_hash_update
+        //      re-loads / stores record_hash_state around each call.
+        //      A wrong per-iteration state persist/reload would still
+        //      agree with a hand-computed single-shot vector (subtest
+        //      10) but would break this equality — the two subtests
+        //      together are a stronger check than either alone.
+        call audit_hash_init;
+
+        lea rdi, [rip + trg_fnv_foo];
+        mov rsi, 3;                               // byte count for "foo"
+        call audit_hash_update;
+        cmp rax, 0;
+        jne trg_fail_11;
+
+        lea rdi, [rip + trg_fnv_bar];
+        mov rsi, 3;                               // byte count for "bar"
+        call audit_hash_update;
+        cmp rax, 0;
+        jne trg_fail_11;
+
+        call audit_hash_finalize;
+        mov r13, 0x85944171f73967e8;              // FNV-1a-64("foobar")
+        cmp rax, r13;
+        jne trg_fail_11;
+
         // All subtests passed.
         xor rax, rax;                            // 0 = all pass
         pop r13;
@@ -321,6 +425,18 @@ module TestReplayGolden = structure {
 
       trg_fail_9:
         mov rax, 9;
+        pop r13;
+        pop r12;
+        ret;
+
+      trg_fail_10:
+        mov rax, 10;
+        pop r13;
+        pop r12;
+        ret;
+
+      trg_fail_11:
+        mov rax, 11;
         pop r13;
         pop r12;
         ret;

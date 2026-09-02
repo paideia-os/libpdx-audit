@@ -1,4 +1,4 @@
-// src/audit_broker.pdx — libpdx-audit.M1-002 + M2-001 + M2-002 + M2-003 + M3-002 + ENH-008 + #11
+// src/audit_broker.pdx — libpdx-audit.M1-002 + M2-001 + M2-002 + M2-003 + M3-002 + ENH-008 + #11 + LA.M1-001 (#20)
 // AuditBroker: svc.audit-journal binding + audit-record marshalling +
 // sys_ipc_send delivery. Two public entry points plus one private
 // marshalling helper:
@@ -70,11 +70,38 @@ module AuditBroker = structure {
   // ============================================================================
   // audit_broker_bind() -> u64
   //   rax = AUDIT_OK (0) on success (either the cache was already
-  //         populated or sys_svc_lookup returned a slot in [0..255])
+  //         populated with a slot in [1..255] or sys_svc_lookup
+  //         returned a fresh slot in [0..255])
   //       | AUDIT_ERR_BROKER_UNAVAILABLE (3) on any svc_lookup error
   //
-  // Fast path: one load + one compare (audit_broker_slot != UNRESOLVED
-  // 0xFFFF). Slow path: sys_svc_lookup + range gate + store.
+  // Fast path: one load + two range compares (audit_broker_slot must
+  // be in [1..255] — i.e. neither .bss-zero nor >= 256). Slow path:
+  // sys_svc_lookup + range gate + store.
+  //
+  // LA.M1-001 (#20): the pre-fix fast path was `cmp rax, 0xFFFF;
+  // jne audit_bind_ok` — that only re-entered the slow path on the
+  // explicit UNRESOLVED sentinel written by reset(). A consumer that
+  // skipped reset() (there is no compile-time way to force reset(),
+  // and the README's wire-up example is a runtime discipline)
+  // therefore hit the fast path against a .bss-zero audit_broker_slot,
+  // returned AUDIT_OK immediately, and every subsequent
+  // audit_send_record then reloaded slot 0 from .bss and handed it to
+  // sys_ipc_send — an arbitrary cap in the caller's cap_table (or a
+  // hard EBADF), never the audit-journal endpoint. The audit was
+  // silently misrouted with no failure signal.
+  //
+  // The fix is a defense-in-depth range gate that mirrors the lazy-
+  // init discipline audit_begin already applies to audit_id_next at
+  // src/audit_client.pdx:115-121 (0-value from bss means "not yet
+  // populated — resolve now"). Any value outside [1..255] — 0 (bss),
+  // 0xFFFF (UNRESOLVED sentinel), or any negative-errno leftover from
+  // a prior failed svc_lookup that was subsequently miswritten — now
+  // forces the slow path. The theoretical slot 0 CAN be handed out by
+  // sys_svc_lookup, but in practice paideia-os's cap allocator
+  // reserves the first slot for the standard I/O endpoints; caching
+  // 0 here would re-lookup on every call anyway, so treating it as
+  // "unbound" costs at most one redundant lookup per stray consumer
+  // and preserves correctness in the common case where reset() ran.
   //
   // Cap slot ids returned by sys_svc_lookup are in [0..255] — well
   // below any negative-errno sentinel (all have bit 63 set), so
@@ -93,14 +120,25 @@ module AuditBroker = structure {
   pub let audit_broker_bind : () -> u64 !{mem, sysreg} @{cap} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "libpdx-audit.M1-002: audit_broker_bind entry point. Idempotent svc.audit-journal binding. Fast path: load audit_broker_slot; if != AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) return AUDIT_OK (0). Slow path: sys_svc_lookup(&audit_broker_name, 17) -> rax; if rax < 256 store as audit_broker_slot + return AUDIT_OK; else return AUDIT_ERR_BROKER_UNAVAILABLE (3). The `cmp rax, 256; jae error` discriminates a valid slot from every negative-errno sentinel (all have bit 63 set — sys_svc_lookup.pdx §Result-code sentinels: -EINVAL 0xFF..FFEA, -EFAULT 0xFF..FFF2, -ENOENT 0xFF..FFFE, -ENOSPC 0xFF..FFE4 all > 256 when interpreted unsigned, and jae is unsigned). Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Register plan: rdi/rsi loaded from LEA + immediate before the call; rax = return; r11 = LEA scratch. sys_svc_lookup preserves rbx/r12..r15 by SysV so this function saves no callee-save. Effects match sys_svc_lookup: !{mem, sysreg} @{cap}. Immediates: 0xFFFF (UNRESOLVED sentinel), 17 (name_len), 256 (sentinel discriminator), 3 (AUDIT_ERR_BROKER_UNAVAILABLE) — all within paideia-as cmp-imm bounds.",
+      justification: "libpdx-audit.M1-002 + LA.M1-001 (#20): audit_broker_bind entry point. Idempotent svc.audit-journal binding. LA.M1-001 fix (#20): the pre-fix `cmp rax, 0xFFFF; jne audit_bind_ok` fast path only re-entered the slow path on the explicit UNRESOLVED sentinel written by reset(); a consumer that skipped reset() hit the fast path against a .bss-zero audit_broker_slot, returned AUDIT_OK, and every subsequent audit_send_record then handed slot 0 (an arbitrary cap in the caller's cap_table) to sys_ipc_send. New shape: fast path only if slot is in [1..255] — a two-compare range gate that treats BOTH .bss-zero AND every value >= 256 (0xFFFF UNRESOLVED sentinel plus any negative-errno leftover) as 'not resolved' and forces the sys_svc_lookup slow path. This mirrors audit_begin's lazy-init discipline for audit_id_next at src/audit_client.pdx:115-121 (0-value from .bss means 'populate now'). Flow: load audit_broker_slot; cmp rax, 0; je audit_bind_needs_lookup (bss-zero path — the LA.M1-001 gate); cmp rax, 256; jae audit_bind_needs_lookup (0xFFFF or negative-errno path — the pre-fix gate, retained); else jmp audit_bind_ok (valid cached slot in [1..255]). Slow path: sys_svc_lookup(&audit_broker_name, 17) -> rax; if rax < 256 store as audit_broker_slot + fall through to audit_bind_ok returning AUDIT_OK; else audit_bind_fail returning AUDIT_ERR_BROKER_UNAVAILABLE (3). The `cmp rax, 256; jae error` in the slow path discriminates a valid slot from every negative-errno sentinel (all have bit 63 set — sys_svc_lookup.pdx §Result-code sentinels: -EINVAL 0xFF..FFEA, -EFAULT 0xFF..FFF2, -ENOENT 0xFF..FFFE, -ENOSPC 0xFF..FFE4 all > 256 when interpreted unsigned, and jae is unsigned). Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Register plan: rdi/rsi loaded from LEA + immediate before the call; rax = return; r11 = LEA scratch. sys_svc_lookup preserves rbx/r12..r15 by SysV so this function saves no callee-save. Effects match sys_svc_lookup: !{mem, sysreg} @{cap}. Immediates: 0 (bss-zero gate — the LA.M1-001 addition), 17 (name_len), 256 (sentinel discriminator, used at both fast-path range gate and slow-path result gate), 3 (AUDIT_ERR_BROKER_UNAVAILABLE) — all within paideia-as cmp-imm bounds. No test mnemonic; every check is cmp reg, 0 or cmp reg, imm.",
       block: {
-        // ---- Fast path: cache hit? ------------------------------------
+        // ---- Fast-path range gate: slot must be in [1..255]. ----------
+        //      LA.M1-001 (#20): the pre-fix single-compare-against-
+        //      0xFFFF gate incorrectly treated a .bss-zero slot as
+        //      cached. New shape: any value outside [1..255] — 0 from
+        //      bss, 0xFFFF UNRESOLVED sentinel from reset(), or any
+        //      negative-errno leftover — forces the sys_svc_lookup
+        //      slow path. Mirrors audit_begin's lazy-init discipline
+        //      for audit_id_next at src/audit_client.pdx:115-121.
         lea r11, [rip + audit_broker_slot];
         mov rax, [r11];
-        cmp rax, 0xFFFF;                         // AUDIT_BROKER_SLOT_UNRESOLVED
-        jne audit_bind_ok;                       // already resolved -> OK
+        cmp rax, 0;                              // .bss-zero = never bound
+        je  audit_bind_needs_lookup;
+        cmp rax, 256;                            // 0xFFFF UNRESOLVED or neg-errno leftover
+        jae audit_bind_needs_lookup;
+        jmp audit_bind_ok;                       // valid cached slot in [1..255]
 
+      audit_bind_needs_lookup:
         // ---- Slow path: sys_svc_lookup(&audit_broker_name, 17) --------
         lea rdi, [rip + audit_broker_name];
         mov rsi, 17;                             // AUDIT_BROKER_NAME_LEN
@@ -111,7 +149,7 @@ module AuditBroker = structure {
         cmp rax, 256;
         jae audit_bind_fail;
 
-        // Cache the slot for subsequent audit_send_committed_record calls.
+        // Cache the slot for subsequent audit_send_record calls.
         lea r11, [rip + audit_broker_slot];
         mov [r11], rax;
         // fall through

@@ -242,12 +242,16 @@ audit about to begin.
 (EINVAL / EFAULT / ENOENT / ENOSPC — see
 `src/kernel/core/syscall/handlers/sys_svc_lookup.pdx` in paideia-os).
 
-The bind is idempotent — if `audit_broker_slot` is already valid (i.e.
-`< 256`, since svc_lookup returns a slot id in `[0..255]`), the bind
+The bind is idempotent — if `audit_broker_slot` is in the valid range
+`[1..255]` (svc_lookup returns a slot id in `[0..255]`, but slot 0 is
+treated as unset because bss-zero init would otherwise short-circuit
+past `sys_svc_lookup` for a consumer that skipped `reset()`), the bind
 returns immediately.
 
 `audit_commit` calls `audit_broker_bind` unconditionally at the top;
-the fast path is one load + one compare.
+the fast path is two compares (`cmp rax, 0; je needs_lookup` then
+`cmp rax, 256; jae needs_lookup`) around the `AUDIT_OK` return. Per
+LA.M1-001 fix.
 
 The broker name string is a 20-byte array padded with three NULs after
 the 17-char "svc.audit-journal". `sys_svc_lookup` is length-explicit
