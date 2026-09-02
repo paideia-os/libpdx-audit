@@ -1,0 +1,335 @@
+// src/audit_broker_satellite.pdx — libpdx-audit.LA.M2-004 (#19 Phase B)
+// AuditBrokerSatellite: satellite-tool substitute for AuditBroker in
+// src/audit_broker.pdx. Compiled ONLY under `tools/build.sh
+// --profile=satellite` and packaged into build-out/libpdx-audit-
+// satellite.a; the kernel profile keeps the on-tree audit_broker.pdx
+// byte-identical.
+//
+// Reason for existence:
+// --------------------
+// mkfs.pdxfs / mount.pdxfs / umount.pdxfs are host-toolchain-linked
+// binaries that ship an audit_wire.o calling audit_begin / audit_commit
+// as bare cross-module labels. libpdx-audit today (v1.1.0) only supplies
+// kernel-side implementations of the transitive audit_send_record ->
+// audit_broker_bind -> sys_svc_lookup / sys_ipc_send call chain, so the
+// satellite ld line ends with two undefined references (audit_begin +
+// audit_commit). This module + syscall_shim_satellite.pdx close that
+// gap by providing satellite-safe substitutes for audit_broker_bind,
+// audit_send_record, and the three syscall trampolines the satellite
+// audit path relies on.
+//
+// Design reference: paideia-os
+//   design/infrastructure/satellite-runtime-shim.md §3.3 (owner + shape
+//   decisions) + §4.2 (implementation spec).
+//
+// Symbols exported (unqualified linker names — audit_client.pdx +
+// audit_wire.pdx resolve them by bare label match):
+//   audit_broker_bind    -- fail-open stub, returns AUDIT_OK immediately
+//                           without touching the (satellite-absent) svc
+//                           broker. Sets audit_broker_slot to the new
+//                           AUDIT_BROKER_SLOT_SATELLITE sentinel
+//                           (0xFFFE) so a downstream diagnostic
+//                           distinguishes a satellite-bound slot from a
+//                           real kernel slot in [0..255] and from the
+//                           reset() UNRESOLVED sentinel (0xFFFF). The
+//                           sentinel is never dereferenced — the
+//                           satellite sys_ipc_send in
+//                           syscall_shim_satellite.pdx ignores its
+//                           cap_slot argument and writes the JSONL-
+//                           encoded record to fd 2 unconditionally.
+//   audit_send_record    -- marshals the @0.2 hybrid payload into
+//                           audit_payload_scratch exactly as the kernel
+//                           broker does (byte-for-byte identical shape —
+//                           the wire discipline in
+//                           design/architecture.md §12.6 is preserved
+//                           so a future kernel-side satellite-audit
+//                           sink can ingest satellite records verbatim),
+//                           then invokes the satellite sys_ipc_send
+//                           which JSONL-formats the payload to fd 2.
+//                           No retry loop — the underlying write(2)
+//                           call either succeeds outright or is treated
+//                           best-effort (design §3.3 satellite audit
+//                           posture).
+//
+// Symbols intentionally NOT re-exported:
+//   audit_marshal_string -- would collide with the same-named private
+//                           helper in audit_broker.pdx if both files
+//                           ever landed in the same link. The
+//                           satellite build path swaps in the entire
+//                           audit_broker source (no double
+//                           definition risk) but audit_send_record
+//                           here calls audit_bs_marshal_string (bs =
+//                           broker-satellite) locally so the two
+//                           source files can also coexist during
+//                           local development or in a hybrid test
+//                           harness.
+//
+// Cross-module functions called:
+//   sys_ipc_send         (src/syscall_shim_satellite.pdx — satellite
+//                          audit-emission point; JSONL-formats to fd 2)
+// Cross-module symbols read/written (all in AuditRecord .bss, from
+// src/audit_record.pdx — reused verbatim under both profiles):
+//   audit_broker_slot,          record_audit_id,
+//   record_op_name_ptr,         record_op_args_ptr,
+//   record_output_schema_ptr,   record_output_hash,
+//   record_exit_code,           record_parent_audit_id,
+//   audit_payload_scratch,      audit_hdr_scratch
+
+module AuditBrokerSatellite = structure {
+
+  // ============================================================================
+  // AUDIT_BROKER_SLOT_SATELLITE — sentinel written into audit_broker_slot
+  // by the satellite audit_broker_bind. 0xFFFE was chosen to be:
+  //   * outside every valid kernel cap slot ([0..255]);
+  //   * distinguishable from the pre-existing AUDIT_BROKER_SLOT_UNRESOLVED
+  //     (0xFFFF) sentinel written by AuditRecord::reset();
+  //   * distinguishable from every negative-errno leftover
+  //     (all have bit 63 set — well above 0xFFFE).
+  //
+  // A diagnostic that observes audit_broker_slot = 0xFFFE can therefore
+  // conclude "this process ran the satellite audit path" without any
+  // side channel. The value is never dereferenced — the satellite
+  // sys_ipc_send ignores its cap_slot argument.
+  // ============================================================================
+  pub let AUDIT_BROKER_SLOT_SATELLITE : u64 = 0xFFFE
+
+  // ============================================================================
+  // audit_broker_bind() -> u64
+  //   rax = AUDIT_OK (0) always
+  //
+  // Satellite stub. No kernel service broker to consult, no cap_table
+  // to populate, no privilege dependency. Marks audit_broker_slot with
+  // the AUDIT_BROKER_SLOT_SATELLITE (0xFFFE) sentinel so downstream
+  // diagnostics disambiguate a satellite bind from a kernel bind or an
+  // UNRESOLVED pre-bind state. The sentinel is never dereferenced.
+  //
+  // Effect tail deliberately narrower than the kernel broker's
+  // `!{mem, sysreg} @{cap}` — this stub only writes one .bss slot; it
+  // never issues a syscall and consumes no cap. paideia-as accepts a
+  // callee with narrower effects than the caller declares (audit_client.
+  // pdx's audit_begin still declares `!{mem, sysreg} @{cap, sched}` and
+  // that remains sound: the caller may be MORE permissive than the
+  // callee actually needs).
+  //
+  // Pure leaf; no callee-save touched. Label prefix audit_bs_ per the
+  // project reserved-label discipline (bare 'ok' / 'done' collide with
+  // paideia-as keywords).
+  // ============================================================================
+  pub let audit_broker_bind : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.LA.M2-004 (#19 Phase B): satellite audit_broker_bind. Fail-open stub. Writes AUDIT_BROKER_SLOT_SATELLITE (0xFFFE) into audit_broker_slot via `mov rax, 0xFFFE; lea r11, [rip+audit_broker_slot]; mov [r11], rax`, then returns AUDIT_OK (0) via `xor rax, rax; ret`. Never calls sys_svc_lookup — satellite tools have no paideia-os service broker to resolve against. The 0xFFFE sentinel is chosen to be outside the valid cap slot range [0..255], distinguishable from the AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) sentinel that reset() writes, and distinguishable from every negative-errno leftover (all have bit 63 set). Not dereferenced — the satellite sys_ipc_send (src/syscall_shim_satellite.pdx) ignores its cap_slot argument and writes the JSONL-encoded record to fd 2 unconditionally. Effect tail !{mem} @{} — pure .bss write, no syscall, no cap consumption; matches the design's satellite-broker-has-no-cap-consumption invariant per satellite-runtime-shim.md §4.2 (`Userspace safety: the satellite broker's only host syscalls are write(2) and getpid(2)`) — those live in sys_ipc_send and sys_getpid respectively, not here. Callers with wider declared effects (audit_client.pdx's audit_send_record with `!{mem, sysreg} @{cap, sched}`, itself called from audit_begin/audit_record_output/audit_commit) still typecheck: a callee with narrower effects than a caller declares is always sound. Pure leaf: no push/pop, no nested call. Register plan: rax = sentinel value then return code, r11 = LEA scratch. Immediates: 0xFFFE (sentinel value — fits in mov r64, imm32 encoding, well within the cmp-imm 0x7FFFFFFF bound though not compared here). Label prefix audit_bs_ per the reserved-label discipline (no labels in this function's body since it is straight-line, but the prefix is reserved for consistency with the module's other functions).",
+      block: {
+        mov rax, 0xFFFE;                         // AUDIT_BROKER_SLOT_SATELLITE
+        lea r11, [rip + audit_broker_slot];
+        mov [r11], rax;
+
+        xor rax, rax;                            // AUDIT_OK
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // audit_send_record(event_kind) -> u64
+  //   rdi = event_kind    (UEJ_KIND_TOOL_INVOKE | OUTPUT | EXIT)
+  //   rax = AUDIT_OK      always (satellite emission is best-effort;
+  //                       see design §3.3)
+  //
+  // Marshals the @0.2 hybrid payload into audit_payload_scratch using
+  // the same offset table the kernel AuditBroker uses (source of truth
+  // for the offset constants: src/audit_record.pdx AUDIT_OFF_*), then
+  // writes AUDIT_HDR_WORD (0x0000010000000220) into audit_hdr_scratch,
+  // then calls the satellite sys_ipc_send which JSONL-formats the
+  // payload to fd 2 via Linux write(2).
+  //
+  // Wire layout (byte offsets, same as kernel broker):
+  //   [  0.. 8) record_audit_id
+  //   [  8..16) event_kind
+  //   [ 16..24) record_exit_code
+  //   [ 24..32) record_parent_audit_id
+  //   [ 32..40) record_output_hash
+  //   [ 40.. 72) op_name        (32-byte inline NUL-terminated)
+  //   [ 72..200) op_args        (128-byte inline NUL-terminated)
+  //   [200..232) output_schema  (32-byte inline NUL-terminated)
+  //   [232..256) reserved       (.bss zero, never written)
+  //
+  // No M2-003 retry loop — Linux write(2) either accepts the buffer or
+  // fails hard; there is no EAGAIN back-pressure on fd 2 for a
+  // satellite tool talking to a live terminal. Emission is best-effort
+  // per design §3.3 (`AUDIT_MODE=stderr` posture).
+  //
+  // Register plan: r12 = event_kind (SysV callee-save, preserved across
+  // every nested call — bind, three marshal_string, and sys_ipc_send);
+  // r13 pushed alongside r12 as an alignment pair matching the kernel
+  // AuditBroker::audit_send_record shape one-for-one. rax/rcx/rdi/rsi/
+  // rdx are caller-save and get re-loaded before every use.
+  // ============================================================================
+  pub let audit_send_record : (u64) -> u64 !{mem} @{} =
+    fn (event_kind: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.LA.M2-004 (#19 Phase B): satellite audit_send_record. Marshals the @0.2 hybrid payload into audit_payload_scratch (offset table copied verbatim from src/audit_broker.pdx — five numeric header words at 0/8/16/24/32 plus three inline NUL-terminated string fields copied via audit_bs_marshal_string at 40/72/200 with 32/128/32 widths, 24 reserved bytes at 232 left at .bss zero) then writes AUDIT_HDR_WORD (0x0000010000000220 — op=0x20 AUDIT_EVENT | ver=2 | reply_ep=0 | payload_len=256) into audit_hdr_scratch, then calls sys_ipc_send(cap_slot=audit_broker_slot, hdr_va, payload_va, 256). The satellite sys_ipc_send ignores cap_slot and JSONL-formats the payload to fd 2 via Linux write(2); its return code is discarded here — satellite audit emission is best-effort per design §3.3, so audit_send_record always returns AUDIT_OK. Under the kernel profile the caller's propagation (AUDIT_OK triggers the audit_begin lazy-init of audit_last_error to AUDIT_OK; a non-OK return would set the sticky failure flag) still typechecks the same way — this function is drop-in ABI-compatible with the kernel broker's audit_send_record. Prologue: push r12; push r13 (alignment pair matching src/audit_broker.pdx one-for-one — kernel-side comment there notes the two pushes keep rsp % 16 aligned across the nested calls). r12 = event_kind (SysV callee-save, preserved across bind + three marshal + send). Body: (1) call audit_broker_bind — idempotent, sets AUDIT_BROKER_SLOT_SATELLITE sentinel in audit_broker_slot and returns AUDIT_OK. Return code discarded (bind never fails on the satellite path). (2) Marshal five numeric header words via `lea r11, [rip+sym]; mov rax, [r11]; mov [scratch+off], rax` at offsets 0/16/24/32 from AuditRecord fields, offset 8 directly from r12 (event_kind). (3) Marshal three inline string fields via three calls to audit_bs_marshal_string: (dst=scratch+40, src=record_op_name_ptr, max_len=32), (dst=scratch+72, src=record_op_args_ptr, max_len=128), (dst=scratch+200, src=record_output_schema_ptr, max_len=32) — same shape and semantics as the kernel broker's audit_marshal_string. Destination addresses computed via `lea rdi, [rip+audit_payload_scratch]; add rdi, OFF` matching the kernel broker's offset-via-add idiom. (4) Write AUDIT_HDR_WORD (0x0000010000000220) into audit_hdr_scratch via `mov rax, imm64; lea r11, [rip+audit_hdr_scratch]; mov [r11], rax` — MOVABS is the paideia-as encoding for a 64-bit immediate load, unrestricted by the cmp-imm 0x7FFFFFFF bound. (5) Call sys_ipc_send with (rdi = audit_broker_slot from .bss, rsi = &audit_hdr_scratch, rdx = &audit_payload_scratch, rcx = 256). (6) Epilogue: xor rax, rax (AUDIT_OK); pop r13; pop r12; ret. Cross-module writes via lea r11,[rip+sym]+mov per parser.pdx pattern. Effect tail !{mem} @{} — no paideia-os cap consumed on the satellite path; the Linux syscall inside sys_ipc_send is outside paideia-as's effect algebra and is declared !{mem, sysreg} @{} at the callee. Callers with wider declared effects still typecheck (narrowing is sound). Immediates: 40/72/200 (inline string field offsets), 32/128/32 (inline string field widths), 256 (payload_len), and the packed hdr word 0x0000010000000220 (loaded via MOVABS). No test mnemonic; no compare in this function at all (audit_broker_bind and sys_ipc_send return codes are both intentionally ignored — the satellite path has no failure recovery discipline). Label prefix asr_ shared with the kernel broker's shape for symmetry but the function body is straight-line and needs no labels of its own.",
+      block: {
+        push r12;
+        push r13;                                // alignment pair (see kernel audit_send_record)
+        mov r12, rdi;                            // r12 = event_kind (saved across every call below)
+
+        // ---- Step 1: bind (idempotent — sentinel-writing stub). -------
+        call audit_broker_bind;
+
+        // ---- Step 2: marshal the five numeric header words. -----------
+        // Offset 0 — record_audit_id (composed (pid << 32) | local_id).
+        lea r11, [rip + record_audit_id];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 0], rax;
+
+        // Offset 8 — event_kind (from r12 saved on entry).
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 8], r12;
+
+        // Offset 16 — record_exit_code.
+        lea r11, [rip + record_exit_code];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 16], rax;
+
+        // Offset 24 — record_parent_audit_id.
+        lea r11, [rip + record_parent_audit_id];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 24], rax;
+
+        // Offset 32 — record_output_hash.
+        lea r11, [rip + record_output_hash];
+        mov rax, [r11];
+        lea r11, [rip + audit_payload_scratch];
+        mov [r11 + 32], rax;
+
+        // ---- Step 3: marshal the three inline string fields. ----------
+        // Offset 40 (32 bytes) — op_name.
+        lea rdi, [rip + audit_payload_scratch];
+        add rdi, 40;
+        lea r11, [rip + record_op_name_ptr];
+        mov rsi, [r11];
+        mov rdx, 32;
+        call audit_bs_marshal_string;
+
+        // Offset 72 (128 bytes) — op_args.
+        lea rdi, [rip + audit_payload_scratch];
+        add rdi, 72;
+        lea r11, [rip + record_op_args_ptr];
+        mov rsi, [r11];
+        mov rdx, 128;
+        call audit_bs_marshal_string;
+
+        // Offset 200 (32 bytes) — output_schema.
+        lea rdi, [rip + audit_payload_scratch];
+        add rdi, 200;
+        lea r11, [rip + record_output_schema_ptr];
+        mov rsi, [r11];
+        mov rdx, 32;
+        call audit_bs_marshal_string;
+
+        // Offset 232..256 — 24 reserved bytes, .bss zero-init preserved.
+
+        // ---- Step 4: write the packed hdr word. -----------------------
+        mov rax, 0x0000010000000220;             // AUDIT_HDR_WORD (@0.2)
+        lea r11, [rip + audit_hdr_scratch];
+        mov [r11], rax;
+
+        // ---- Step 5: emit via satellite sys_ipc_send (fd 2 JSONL). ----
+        lea r11, [rip + audit_broker_slot];
+        mov rdi, [r11];                          // cap_slot (ignored by satellite sys_ipc_send)
+        lea rsi, [rip + audit_hdr_scratch];      // hdr_va
+        lea rdx, [rip + audit_payload_scratch];  // payload_va
+        mov rcx, 256;                            // payload_len
+        call sys_ipc_send;
+
+        // ---- Epilogue: always AUDIT_OK; satellite emission is best-effort.
+        xor rax, rax;                            // AUDIT_OK
+        pop r13;
+        pop r12;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // audit_bs_marshal_string(dst_ptr, src_ptr, max_len) -> ()  [private]
+  //   rdi = dst_ptr    (absolute VA inside audit_payload_scratch)
+  //   rsi = src_ptr    (sender-owned NUL-terminated string; 0 is legal)
+  //   rdx = max_len    (destination field capacity in bytes, incl. NUL)
+  //
+  // Byte-for-byte copy of AuditBroker::audit_marshal_string. Copies up
+  // to (max_len - 1) bytes from src_ptr into dst_ptr, stopping early at
+  // the source's own NUL terminator, then zero-pads through max_len
+  // (including the reserved terminator byte at max_len - 1). src_ptr
+  // == 0 yields an all-zero (empty) field.
+  //
+  // Prefix audit_bs_ (broker-satellite) so this helper's symbol is
+  // distinct from the kernel-side audit_marshal_string at any link
+  // that ever mixes both (satellite build swaps in the entire audit_
+  // broker source so the kernel variant is absent, but keeping the
+  // symbol namespaced avoids a latent hazard in any hybrid test
+  // harness).
+  //
+  // Byte loads/stores walk rdi/rsi via `add reg, 1` per iteration
+  // rather than an indexed [base + idx] form — same rationale as
+  // AuditBroker::audit_marshal_string (matches paideia-os's
+  // src/tools/mkfs-pdxb/uuid.pdx parse_dashed loop; sidesteps
+  // paideia-as's SIB-scale-fold operand-parse bug U1606).
+  // ============================================================================
+  let audit_bs_marshal_string : (u64, u64, u64) -> () !{mem} @{} =
+    fn (dst_ptr: u64) (src_ptr: u64) (max_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.LA.M2-004 (#19 Phase B): satellite audit_marshal_string. Byte-for-byte copy of AuditBroker::audit_marshal_string logic (src/audit_broker.pdx). Copies (max_len - 1) bytes from src_ptr into dst_ptr, stopping early at the source's NUL terminator, zero-padding through max_len including the reserved terminator byte at max_len - 1. src_ptr == 0 skips straight to the zero-fill path via ams_bs_zero_fill, producing an all-zero (empty-string) field. Copy loop bound is r9 = max_len - 1 (computed once via `mov r9, rdx; sub r9, 1`) rather than max_len itself, so the copy loop never writes the reserved terminator byte; the pad loop then zero-fills from wherever the copy loop stopped through max_len, which always includes that reserved byte. Byte load: `xor rax, rax; mov_b rax, [rsi]` (paideia-as #1248 mitigation — mov_b does not zero-extend on its own; matches src/audit_hash.pdx's audit_hash_update byte-load shape). Byte store: `mov_b [rdi], rax` (G1 sized-store form per src/tools/mkfs-pdxb/uuid.pdx's ph32_top loop in paideia-os). Both src and dst walked via `add reg, 1` per iteration rather than an indexed addressing form, sidestepping the SIB-scale-fold operand-parse bug U1606. Prefix audit_bs_ ensures the symbol name is distinct from the kernel-side audit_marshal_string at any link that ever mixes both. Pure leaf — no push/pop, no nested call; r9 is caller-save under SysV and this function makes no call of its own, so clobbering it is safe. Effect tail !{mem} @{} — pure memory read (sender's own string) + write (audit_payload_scratch), no syscall, no cap. Immediates: 0 (src_ptr null-check + byte-zero-check), 1 (the sub r9, 1 terminator reservation and the per-iteration pointer/index advance) — both within the 0x7FFFFFFF cmp-imm bound. Label prefix ams_bs_ per the reserved-label discipline.",
+      block: {
+        xor rcx, rcx;                            // byte index = 0
+        mov r9, rdx;
+        sub r9, 1;                               // r9 = max copyable count
+
+        cmp rsi, 0;                              // src_ptr == 0 ?
+        je  ams_bs_zero_fill;
+
+      ams_bs_copy_loop:
+        cmp rcx, r9;
+        jae ams_bs_pad;
+
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0;                              // source NUL ?
+        je  ams_bs_pad;
+
+        mov_b [rdi], rax;
+        add rdi, 1;
+        add rsi, 1;
+        add rcx, 1;
+        jmp ams_bs_copy_loop;
+
+      ams_bs_pad:
+        cmp rcx, rdx;
+        jae ams_bs_done;
+
+        xor rax, rax;
+        mov_b [rdi], rax;
+        add rdi, 1;
+        add rcx, 1;
+        jmp ams_bs_pad;
+
+      ams_bs_zero_fill:
+        xor rcx, rcx;
+
+      ams_bs_zero_loop:
+        cmp rcx, rdx;
+        jae ams_bs_done;
+
+        xor rax, rax;
+        mov_b [rdi], rax;
+        add rdi, 1;
+        add rcx, 1;
+        jmp ams_bs_zero_loop;
+
+      ams_bs_done:
+        ret;
+      }
+    }
+}

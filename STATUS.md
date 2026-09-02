@@ -1,10 +1,13 @@
 # libpdx-audit — status
 
-**Wave:** R49 shared library
-**Current milestone:** Post-1.0.0 correctness + enhancement rollup
-(wire `@0.2` pair `#11`/`#12`, `ENH-003…008`, `LA.M1` `#20`–`#24`,
-`LA.M2` `#25`–`#29`) — all landed on `main`, rolling into v1.1.0.
-**Version:** 1.1.0 (pending tag; predecessor `v1.0.0` shipped 2026-08-22)
+**Wave:** R49 shared library + R91-XREPO.M1 satellite runtime shim
+**Current milestone:** Satellite runtime shim (R91-XREPO.M1 Phase B,
+`LA.M2-004` closing `#19`) — landed on `main`, rolling into v1.1.1.
+Post-1.0.0 correctness + enhancement rollup (wire `@0.2` pair
+`#11`/`#12`, `ENH-003…008`, `LA.M1` `#20`–`#24`, `LA.M2` `#25`–`#29`)
+already landed at v1.1.0 (2026-09-02).
+**Version:** 1.1.1 (pending tag; predecessors: `v1.1.0` 2026-09-02,
+`v1.0.0` 2026-08-22)
 
 ## Milestone progress
 
@@ -145,8 +148,10 @@ wave-level rationale and the full milestone breakdown. See
 
 All milestones M1..M5 landed at v1.0.0. Post-v1.0.0, the following
 correctness + enhancement waves landed on `main` and roll into
-**v1.1.0** (2026-09-02, LA.M2-003 rollup; git tag `v1.1.0` applied
-by main at push time per the version-discipline convention):
+**v1.1.0** (2026-09-02, LA.M2-003 rollup); the R91-XREPO.M1 satellite
+runtime shim then landed and rolls into **v1.1.1** (2026-09-02,
+LA.M2-004 closing `#19`; git tags `v1.1.0` and `v1.1.1` applied by
+main at push time per the version-discipline convention):
 
 - **Wire-format `@0.2` (coordinated pair)** — `#11` (inline strings
   in the audit record; `op_name` / `op_args` / `output_schema` no
@@ -184,6 +189,75 @@ by main at push time per the version-discipline convention):
   source), `#27` (v1.1.0 rollup — this entry), `#28`
   (`design/architecture.md` §10 section reorder), `#29` (this
   file's post-1.0.0 disclosure).
+
+## Satellite runtime shim (R91-XREPO.M1 Phase B, v1.1.1)
+
+`LA.M2-004` closes libpdx-audit#19 — the last two undefined
+references (`audit_begin` / `audit_commit`, via the transitive
+`audit_send_record` -> `audit_broker_bind` -> `sys_svc_lookup` /
+`sys_ipc_send` call chain) that blocked satellite tools
+(`mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`) from producing a
+runnable ELF on the host toolchain. Phase A (paideia-as 0.29.1
+satellite runtime shim, already landed) reduced satellite link
+errors from 83 → 2; Phase B closes those two.
+
+Full architecture in paideia-os
+`design/infrastructure/satellite-runtime-shim.md` (§3.3 owner + shape
+decisions, §4.2 implementation spec). Physical shape:
+
+- **Two new modules alongside the on-tree kernel variants:**
+  - `src/audit_broker_satellite.pdx` — provides `audit_broker_bind`
+    (fail-open stub, sets `audit_broker_slot` to the new
+    `AUDIT_BROKER_SLOT_SATELLITE = 0xFFFE` sentinel — outside the
+    valid cap slot range `[0..255]`, distinguishable from the
+    `AUDIT_BROKER_SLOT_UNRESOLVED = 0xFFFF` sentinel that
+    `reset()` writes, and distinguishable from every negative-errno
+    leftover; never dereferenced) and `audit_send_record` (marshals
+    the @0.2 hybrid payload with the byte-for-byte offset table the
+    kernel broker uses, then delegates to the satellite
+    `sys_ipc_send` for emission; always returns `AUDIT_OK` per the
+    best-effort satellite audit posture in design §3.3).
+  - `src/syscall_shim_satellite.pdx` — provides `sys_svc_lookup`
+    (fail-safe stub, never reached on the satellite path but
+    resolvable at link time), `sys_ipc_send` (JSONL-formats the
+    256-byte @0.2 payload into a 640-byte `.bss` buffer and hands
+    it to Linux `write(2)` on fd 2 — line shape
+    `PDXAUDIT {"v":2,"payload_hex":"<512-hex>"}\n`; the `PDXAUDIT`
+    prefix makes the line grep-able, the JSON envelope makes it
+    valid JSONL, and the hex-encoded payload avoids all JSON
+    escaping), and `sys_getpid` (thin Linux `getpid(2)`
+    trampoline — `SYSCALL #39` matches paideia-os's SC+ ID 39
+    numerically, coincidentally).
+
+- **Build change:** `tools/build.sh` grows
+  `--profile={kernel,satellite}`.
+  - Default `kernel` preserves today's behaviour byte-for-byte —
+    every `src/*.pdx` and `tests/*.pdx` compiled to loose `.o`
+    files under `build-out/`; the two `*_satellite.pdx` sources
+    are explicitly excluded so their exported symbols never
+    collide with the kernel variants at any downstream link.
+  - `satellite` compiles the satellite-linkable subset (kernel
+    `audit_broker.pdx` + `syscall_shim.pdx` skipped; satellite
+    variants substituted; `audit_client.pdx` + `audit_record.pdx`
+    + `audit_hash.pdx` compiled unchanged), then packs the
+    resulting object set into
+    `build-out/libpdx-audit-satellite.a` via `ar rcs`. Tests are
+    skipped under this profile — the in-tree stubs
+    (`tests/syscall_shim_stub.pdx`) assume the kernel syscall
+    shim contract. The archive form is load-bearing:
+    `ld --gc-sections` can prune unused entry points from an
+    archive but not from loose objects, letting satellite ELFs
+    (which reference only `audit_begin` / `audit_commit`) link
+    without pulling in every symbol in the library.
+
+Consumption from satellite build.sh scripts is Phase C (out of scope
+for this release; filed as follow-ups in each satellite repo): each
+gains a `--extra-archive
+../libpdx-audit/build-out/libpdx-audit-satellite.a` flag alongside
+paideia-as's `libpaideia_satellite_runtime.a` from 0.29.1.
+
+Semver posture: patch. Additive, source-only, no wire grow, no
+kernel-profile change.
 
 The library remains the template for the peer R49 shared-library
 M5 cuts (libpdx-cap, libpdx-argv, libpdx-semantic-pipe,

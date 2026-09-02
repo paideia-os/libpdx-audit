@@ -1,16 +1,16 @@
-# libpdx-audit v1.1.0 — release manifest (source form)
+# libpdx-audit v1.1.1 — release manifest (source form)
 #
 # This is the human-readable source form of `manifest.pdxsig`. The
 # release tool at pkgs.paideia-os mirror-push time (a) enumerates the
 # artifact list below, (b) recomputes every BLAKE3-256 hash from the
-# repo tree at the v1.0.0 tag, (c) writes the completed manifest into
+# repo tree at the v1.1.1 tag, (c) writes the completed manifest into
 # a binary `manifest.pdxsig`, and (d) invokes
 #   paideia-pq-sign::sign_release_artifact(sk, manifest_path)
 # once with the paideia-release-line Ed25519 secret key and once with
 # the ML-DSA-65 secret key. The two detached signatures are appended
 # to the manifest in the fixed layout below and the resulting
 # `manifest.pdxsig` is pushed to
-#   https://pkgs.paideia-os/main/libpdx-audit/1.1.0/manifest.pdxsig
+#   https://pkgs.paideia-os/main/libpdx-audit/1.1.1/manifest.pdxsig
 # alongside the compiled artifacts.
 #
 # Reference:
@@ -26,29 +26,31 @@
 format-version:      1
 manifest-schema:     paideia-manifest-pdxsig@1
 package-name:        libpdx-audit
-package-version:     1.1.0
-package-release:     R49-M5+LA.M1+LA.M2
+package-version:     1.1.1
+package-release:     R49-M5+LA.M1+LA.M2+LA.M2-004
 package-license:     MIT
 source-repo:         https://github.com/paideia-os/libpdx-audit
-source-commit:       <TAG-v1.1.0-COMMIT-SHA>   # release tool fills in
-source-tag:          v1.1.0
+source-commit:       <TAG-v1.1.1-COMMIT-SHA>   # release tool fills in
+source-tag:          v1.1.1
 
 # ---------------------------------------------------------------
 # Artifact set — every file the compiled package ships. The hash
 # discipline is BLAKE3-256, upper 32 bytes rendered as 64 hex chars.
 # The release tool recomputes each hash from the working tree at the
-# v1.1.0 tag before writing the binary manifest. The order below is
+# v1.1.1 tag before writing the binary manifest. The order below is
 # stable (lexicographic within each section) so the concatenated
 # hash-input is reproducible across signers.
 # ---------------------------------------------------------------
 
 [artifacts.source]
-caps.decl                        blake3-256 = <BLAKE3-caps.decl>
-src/audit_broker.pdx             blake3-256 = <BLAKE3-audit_broker.pdx>
-src/audit_client.pdx             blake3-256 = <BLAKE3-audit_client.pdx>
-src/audit_hash.pdx               blake3-256 = <BLAKE3-audit_hash.pdx>
-src/audit_record.pdx             blake3-256 = <BLAKE3-audit_record.pdx>
-src/syscall_shim.pdx             blake3-256 = <BLAKE3-syscall_shim.pdx>
+caps.decl                             blake3-256 = <BLAKE3-caps.decl>
+src/audit_broker.pdx                  blake3-256 = <BLAKE3-audit_broker.pdx>
+src/audit_broker_satellite.pdx        blake3-256 = <BLAKE3-audit_broker_satellite.pdx>
+src/audit_client.pdx                  blake3-256 = <BLAKE3-audit_client.pdx>
+src/audit_hash.pdx                    blake3-256 = <BLAKE3-audit_hash.pdx>
+src/audit_record.pdx                  blake3-256 = <BLAKE3-audit_record.pdx>
+src/syscall_shim.pdx                  blake3-256 = <BLAKE3-syscall_shim.pdx>
+src/syscall_shim_satellite.pdx        blake3-256 = <BLAKE3-syscall_shim_satellite.pdx>
 
 [artifacts.doc]
 design/architecture.md           blake3-256 = <BLAKE3-architecture.md>

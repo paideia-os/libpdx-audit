@@ -1,5 +1,95 @@
 # libpdx-audit — CHANGELOG
 
+## 1.1.1 — 2026-09-02
+
+**Satellite runtime shim (R91-XREPO.M1 Phase B).** Closes `#19` — the
+last two undefined references (`audit_begin` / `audit_commit`, via the
+transitive `audit_send_record` -> `audit_broker_bind` ->
+`sys_svc_lookup` / `sys_ipc_send` call chain) that blocked satellite
+tools (`mkfs.pdxfs`, `mount.pdxfs`, `umount.pdxfs`) from producing a
+runnable ELF on the host toolchain. Additive source-only change, no
+wire-format grow, no consumer-visible API signature or effect change on
+the kernel-profile path — the pre-Phase-B build invocation is preserved
+byte-for-byte under the default `--profile=kernel`.
+
+Landed under the R91-XREPO.M1 milestone (paideia-as#1348 crypto/sign
+shim was the sibling landing, already shipped as `paideia-as` 0.29.1).
+Full architecture is documented in `paideia-os`'s
+`design/infrastructure/satellite-runtime-shim.md` (§3.3 owner + shape
+decisions, §4.2 implementation spec).
+
+Physical shape:
+
+- **New files:**
+  - `src/audit_broker_satellite.pdx` — exports `audit_broker_bind`
+    (fail-open stub; sets `audit_broker_slot` to the new
+    `AUDIT_BROKER_SLOT_SATELLITE = 0xFFFE` sentinel and returns
+    `AUDIT_OK` without invoking `sys_svc_lookup`) and
+    `audit_send_record` (marshals the @0.2 hybrid payload with the
+    same byte-for-byte offset table the kernel broker uses, then
+    delegates to the satellite `sys_ipc_send` for emission; always
+    returns `AUDIT_OK` per the best-effort satellite audit posture in
+    design §3.3). Also defines a private `audit_bs_marshal_string`
+    helper distinct in symbol name from the kernel-side
+    `audit_marshal_string` so no double-definition hazard exists in a
+    hybrid test harness.
+  - `src/syscall_shim_satellite.pdx` — exports `sys_svc_lookup`
+    (fail-safe stub returning `AUDIT_ERR_BROKER_UNAVAILABLE`; never
+    reached on the satellite path but ships to keep the linker
+    symbol resolvable), `sys_ipc_send` (JSONL-formats the 256-byte
+    @0.2 payload into a 640-byte `.bss` buffer and hands it to
+    Linux `write(2)` on fd 2 — line shape
+    `PDXAUDIT {"v":2,"payload_hex":"<512-hex>"}\n`, no JSON
+    escaping needed because the payload is hex-encoded end-to-end),
+    and `sys_getpid` (thin Linux `getpid(2)` trampoline —
+    `SYSCALL #39`, which numerically coincides with paideia-os's
+    SC+ ID 39 but is a distinct handler under the satellite
+    profile).
+
+- **Build change:** `tools/build.sh` grows `--profile={kernel,satellite}`.
+  - `kernel` (default) preserves today's shape — every `src/*.pdx`
+    and `tests/*.pdx` compiled to loose `.o` files under
+    `build-out/`; the two `*_satellite.pdx` sources are
+    explicitly excluded so their exported symbols never collide
+    with the kernel variants at any downstream link.
+  - `satellite` compiles `audit_client.pdx` + `audit_record.pdx` +
+    `audit_hash.pdx` + `audit_broker_satellite.pdx` +
+    `syscall_shim_satellite.pdx` (kernel `audit_broker.pdx` +
+    `syscall_shim.pdx` skipped), then packs the resulting object
+    set into `build-out/libpdx-audit-satellite.a` via
+    `ar rcs`. Tests are not compiled under this profile — the
+    in-tree test harness stubs (`tests/syscall_shim_stub.pdx`)
+    assume the kernel syscall shim contract. The archive form is
+    load-bearing: `ld --gc-sections` can prune unused entry points
+    from an archive but not from loose objects, letting satellite
+    ELFs (which reference only `audit_begin` / `audit_commit`)
+    link cleanly without pulling in every symbol in the library.
+
+- **Consumption from satellite build.sh scripts** (Phase C, out of
+  scope for this release — filed for follow-up in the four
+  satellite repos): `bash tools/build.sh --extra-archive
+  ../libpdx-audit/build-out/libpdx-audit-satellite.a ...`
+  alongside `paideia-as`'s `libpaideia_satellite_runtime.a` from the
+  0.29.1 landing.
+
+Semver posture: patch (`1.1.0` → `1.1.1`). The addition is source-only
+— zero wire-format change, zero on-tree kernel-profile source change,
+no consumer-visible API signature or effect change. The kernel
+consumer's `.o` set built with `--profile=kernel` is byte-identical to
+the v1.1.0 shape.
+
+Follow-up:
+
+- **libpdx-audit#20** (already filed pre-Phase-B) — `AUDIT_MODE=file`
+  writing to `$XDG_STATE_HOME/paideia/tool-audit.jsonl`. The current
+  satellite emission is always `AUDIT_MODE=stderr` per design §3.3.
+- **paideia-os satellite-audit sink syscall** — a future kernel-side
+  ingest path that absorbs satellite JSONL records into
+  `/system/audit/user-events/`. The @0.2 hybrid payload written by
+  the satellite `sys_ipc_send` is byte-for-byte identical to the
+  kernel wire record, so this ingest is a pure decode + route step
+  once landed.
+
 ## 1.1.0 — 2026-09-02
 
 **Post-v1.0.0 correctness + enhancement rollup.** No wire-format major

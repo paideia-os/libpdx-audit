@@ -1,0 +1,363 @@
+// src/syscall_shim_satellite.pdx — libpdx-audit.LA.M2-004 (#19 Phase B)
+// SyscallShimSatellite: satellite-tool substitute for SyscallShim in
+// src/syscall_shim.pdx. Compiled ONLY under `tools/build.sh
+// --profile=satellite` and packaged into build-out/libpdx-audit-
+// satellite.a.
+//
+// Reason for existence:
+// --------------------
+// The kernel syscall trampolines in src/syscall_shim.pdx issue
+// paideia-os SYSCALLs (SC+ IDs 42, 43, 39) that a Linux host has no
+// notion of. Satellite tools (mkfs.pdxfs, mount.pdxfs, umount.pdxfs)
+// are linked against libpdx-audit on the host toolchain and cannot
+// reach those handlers. The three trampolines here mirror the kernel-
+// side signatures byte-for-byte so audit_client.pdx / audit_broker_
+// satellite.pdx callsites resolve at link time; each one implements
+// the semantics the satellite path actually needs.
+//
+// Design reference: paideia-os
+//   design/infrastructure/satellite-runtime-shim.md §3.3 (owner + shape
+//   decisions) + §4.2 (implementation spec).
+//
+// Exported symbols (unqualified linker names — cross-module callers
+// resolve them by bare label match):
+//
+//   sys_svc_lookup   -- fail-safe stub. Returns AUDIT_ERR_BROKER_
+//                        UNAVAILABLE (3) unconditionally. In practice
+//                        never reached on the satellite path
+//                        (AuditBrokerSatellite::audit_broker_bind fast-
+//                        returns AUDIT_OK before any code reaches
+//                        sys_svc_lookup) but ships to keep the linker
+//                        symbol resolvable in case a divergent library
+//                        or test path references it.
+//
+//   sys_ipc_send     -- audit-emission point. JSONL-formats the 256-
+//                        byte @0.2 hybrid payload the caller hands over
+//                        (rdx = payload_va, rcx = payload_len — MUST
+//                        equal 256 per AuditBrokerSatellite::audit_
+//                        send_record's contract) into a fixed 640-byte
+//                        .bss buffer, then invokes Linux write(2)
+//                        (syscall #1, rdi=2 for STDERR, rsi=buffer,
+//                        rdx=546). Returns AUDIT_OK unconditionally
+//                        (best-effort emission per design §3.3).
+//
+//                        JSONL wire shape (single line, terminated \n):
+//                          PDXAUDIT {"v":2,"payload_hex":"<512-hex>"}\n
+//
+//                        Concrete example (payload truncated for
+//                        clarity; the real line always carries all
+//                        512 hex chars):
+//                          PDXAUDIT {"v":2,"payload_hex":"010000...
+//                                          ...ff00000082000000...0a"}\n
+//
+//                        Decoding: the 512 hex chars are the raw 256
+//                        bytes of the @0.2 audit_payload_scratch, in
+//                        big-endian hex byte-by-byte. Downstream
+//                        consumers extract fields from the fixed
+//                        offset table declared in src/audit_record.pdx
+//                        (AUDIT_OFF_AUDIT_ID = 0, AUDIT_OFF_EVENT_KIND
+//                        = 8, ..., AUDIT_OFF_OUTPUT_SCHEMA = 200).
+//                        No JSON escaping is needed because the
+//                        payload is hex-encoded end-to-end (chars are
+//                        strictly 0-9, a-f) and the surrounding
+//                        envelope carries no caller-controlled bytes.
+//                        The "PDXAUDIT " prefix makes the line grep-
+//                        able out of interleaved stderr streams; the
+//                        {"v":2, ...} envelope makes it valid JSONL
+//                        for any consumer that would rather parse than
+//                        grep. This honors the D3 audit-first pillar —
+//                        every satellite audit record reaches fd 2
+//                        with zero bytes lost, before any tool-visible
+//                        stdout output.
+//
+//   sys_getpid       -- Linux getpid(2) trampoline (SYSCALL #39). On
+//                        x86_64 Linux `unistd_64.h` documents 39 as
+//                        the getpid ordinal; the fact that paideia-
+//                        os's SC+ ID for getpid is ALSO 39 is a
+//                        coincidence (paideia-os assigns SC+ IDs
+//                        independently of Linux) that makes this
+//                        wrapper look identical to the kernel one —
+//                        the mnemonic still says `mov rax, 39;
+//                        syscall; ret`, but the effect is a Linux
+//                        vDSO getpid, not a paideia-os handler. rax
+//                        carries the caller's real Linux pid on
+//                        return (never 0 for a running process, so
+//                        remains a valid non-sentinel value for
+//                        AuditClient::audit_begin's audit_process_pid
+//                        cache).
+
+module SyscallShimSatellite = structure {
+
+  // ============================================================================
+  // Linux x86_64 syscall numbers. Named constants for legibility only —
+  // paideia-as does not currently allow `mov rax, LINUX_SYS_WRITE` (only
+  // an integer immediate), so the constants below are documentation +
+  // future-proofing rather than a live source of the numbers used in
+  // the syscall lines below (which write the integer literal directly
+  // per the kernel syscall_shim.pdx precedent).
+  // ============================================================================
+  pub let LINUX_SYS_WRITE  : u64 = 1
+  pub let LINUX_SYS_GETPID : u64 = 39
+  pub let LINUX_STDERR_FD  : u64 = 2
+
+  // ============================================================================
+  // JSONL prefix and suffix as byte arrays. Byte-array literal form
+  // rather than a string literal to avoid depending on `\"` string
+  // escapes (grep across ~/Development/PaideiaOS/src/kernel/ shows
+  // `\n` and `\0` in use inside string literals but never `\"`; the
+  // byte-array form is unambiguous).
+  //
+  // Prefix (31 bytes, ASCII): `PDXAUDIT {"v":2,"payload_hex":"`
+  //   0x50 P    0x44 D    0x58 X    0x41 A
+  //   0x55 U    0x44 D    0x49 I    0x54 T
+  //   0x20 sp
+  //   0x7B {    0x22 "    0x76 v    0x22 "    0x3A :   0x32 2   0x2C ,
+  //   0x22 "    0x70 p    0x61 a    0x79 y    0x6C l   0x6F o   0x61 a
+  //   0x64 d    0x5F _    0x68 h    0x65 e    0x78 x   0x22 "   0x3A :
+  //   0x22 "
+  // ============================================================================
+  pub let sss_jsonl_prefix : [u8; 31] = [
+    0x50u8, 0x44u8, 0x58u8, 0x41u8, 0x55u8, 0x44u8, 0x49u8, 0x54u8,
+    0x20u8, 0x7Bu8, 0x22u8, 0x76u8, 0x22u8, 0x3Au8, 0x32u8, 0x2Cu8,
+    0x22u8, 0x70u8, 0x61u8, 0x79u8, 0x6Cu8, 0x6Fu8, 0x61u8, 0x64u8,
+    0x5Fu8, 0x68u8, 0x65u8, 0x78u8, 0x22u8, 0x3Au8, 0x22u8
+  ]
+
+  // Suffix (3 bytes, ASCII): `"}` + LF
+  //   0x22 "    0x7D }    0x0A \n
+  pub let sss_jsonl_suffix : [u8; 3] = [
+    0x22u8, 0x7Du8, 0x0Au8
+  ]
+
+  // ============================================================================
+  // .bss buffer for the fully-formatted JSONL line.
+  //   Prefix       :   31 bytes
+  //   512-hex body :  512 bytes  (256 payload bytes * 2 hex chars each)
+  //   Suffix       :    3 bytes
+  //   Total needed :  546 bytes
+  //   Sized 640    :   generous headroom (adds ~94 bytes of BSS but
+  //                    leaves room for a future envelope grow without a
+  //                    resize churn); still under one 4-KiB page.
+  // @align(8) for consistency with the other AuditRecord scratch slots;
+  // Linux write(2) is happy with any byte alignment.
+  // ============================================================================
+  pub let mut sss_jsonl_buffer : [u8; 640] = uninit @align(8)
+
+  // ============================================================================
+  // sys_svc_lookup(name_ptr, name_len) -> u64
+  //   rax = AUDIT_ERR_BROKER_UNAVAILABLE (3) always
+  //
+  // Fail-safe stub. The satellite audit path never reaches this
+  // symbol — AuditBrokerSatellite::audit_broker_bind fast-returns
+  // AUDIT_OK before any callchain would invoke sys_svc_lookup — but
+  // the symbol must resolve at link time in case a divergent code path
+  // (e.g. a partially satellite-linked test binary that reuses the
+  // kernel audit_broker) references it. Returning
+  // AUDIT_ERR_BROKER_UNAVAILABLE keeps such a divergent path on the
+  // fail-closed branch of the kernel audit_broker_bind flow.
+  //
+  // Pure leaf; no callee-save touched.
+  // ============================================================================
+  pub let sys_svc_lookup : (u64, u64) -> u64 !{mem} @{} =
+    fn (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.LA.M2-004 (#19 Phase B): satellite sys_svc_lookup stub. Returns AUDIT_ERR_BROKER_UNAVAILABLE (3) unconditionally without invoking any Linux syscall or examining rdi/rsi. The AuditBrokerSatellite::audit_broker_bind fast-return means AuditBrokerSatellite::audit_send_record never reaches this stub on the satellite audit path — this symbol exists purely to keep the linker resolvable for any divergent code path (e.g. a partially satellite-linked test binary that references the kernel audit_broker.pdx variant of audit_broker_bind, which does call sys_svc_lookup). Effect tail !{mem} @{} — no side effects, no syscall, no cap. Pure leaf: no push/pop, no nested call. Register plan: rax = return code. Immediates: 3 (AUDIT_ERR_BROKER_UNAVAILABLE) — within the cmp-imm bound. Label prefix sss_ per project reserved-label discipline (no labels in this straight-line body).",
+      block: {
+        mov rax, 3;                              // AUDIT_ERR_BROKER_UNAVAILABLE
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // sys_ipc_send(cap_slot, user_hdr_va, user_payload_va, payload_len) -> u64
+  //   rdi = cap_slot         (ignored — satellite has no cap_table)
+  //   rsi = user_hdr_va      (ignored — hdr is redundant given the
+  //                            fixed AUDIT_HDR_WORD wire shape and the
+  //                            fixed 256-byte payload_len)
+  //   rdx = user_payload_va  (the 256-byte @0.2 payload to hex-encode)
+  //   rcx = payload_len      (MUST equal 256 per satellite
+  //                            audit_send_record's contract; not
+  //                            verified here — over/under lengths
+  //                            would produce a malformed line but not
+  //                            a memory-safety error since the loop
+  //                            is bounded by the compile-time 256)
+  //   rax = AUDIT_OK         always (best-effort emission per §3.3)
+  //
+  // JSONL-formats the payload to fd 2 in one Linux write(2) call.
+  //
+  // Wire shape: PDXAUDIT {"v":2,"payload_hex":"<512-hex>"}\n
+  //   * "PDXAUDIT " prefix keeps the line grep-able in interleaved
+  //     stderr output.
+  //   * The `v:2` field pins the wire version so a future v3 line
+  //     shape lands under an obvious branch point.
+  //   * `payload_hex` is the raw 256-byte payload rendered as 512
+  //     lowercase hex characters, byte 0 first. Consumers decode
+  //     fields from the fixed offset table in src/audit_record.pdx
+  //     (AUDIT_OFF_AUDIT_ID = 0, AUDIT_OFF_EVENT_KIND = 8, ...,
+  //     AUDIT_OFF_OUTPUT_SCHEMA = 200).
+  //   * No JSON escaping needed anywhere in the line — the hex payload
+  //     is strictly [0-9a-f] and the surrounding envelope carries no
+  //     caller-controlled bytes.
+  //
+  // Register plan: r12/r13/r14/r15 all pushed (4 callee-save
+  // preserved; keeps the syscall clean and matches the kernel
+  // syscall_shim's discipline of not touching callee-save
+  // gratuitously). r12 = source payload cursor (walks byte-by-byte via
+  // `mov_b rax, [r12]; add r12, 1`); r13 = destination cursor into
+  // sss_jsonl_buffer (walks byte-by-byte via `mov_b [r13], ...; add
+  // r13, 1`); r14 = hex byte counter (0..256); r15 = alignment
+  // padding push. rax/rcx/rdi/rsi/rdx are caller-save and re-loaded
+  // before every use. r8 = low-nibble scratch inside the hex loop.
+  //
+  // Low-nibble extraction uses `mov r8, rax; shl r8, 60; shr r8, 60`
+  // rather than `and r8, 0xF`. Both are correct; the shift pair is
+  // used because it relies only on mnemonics already proven live in
+  // audit_hash.pdx and audit_broker.pdx across the repo. (`and` IS
+  // used elsewhere in paideia-os — kernel_main_uefi.pdx line 155 has
+  // `and rax, 0x20` — but this module deliberately keeps its
+  // instruction set to what's already exercised in libpdx-audit
+  // itself, matching the encoder-conservative discipline.)
+  //
+  // Hex-digit conversion: `cmp reg, 10; jae letter; add reg, 0x30
+  // (jmp done); letter: add reg, 0x57`. 0x30 = '0' (ASCII), 0x57 =
+  // 'a' - 10 = 97 - 10 → produces lowercase hex letters a..f.
+  // ============================================================================
+  pub let sys_ipc_send : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (cap_slot: u64) (user_hdr_va: u64) (user_payload_va: u64) (payload_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "libpdx-audit.LA.M2-004 (#19 Phase B): satellite sys_ipc_send. Ignores cap_slot (rdi) and user_hdr_va (rsi); reads 256 bytes from user_payload_va (rdx at entry, saved into r12) and hex-encodes them into sss_jsonl_buffer between the fixed 31-byte prefix and the fixed 3-byte suffix, then invokes Linux write(2) (syscall #1, rdi=STDERR=2, rsi=&sss_jsonl_buffer, rdx=546). Return value from Linux write(2) is discarded — the caller ALWAYS sees AUDIT_OK because the satellite audit path must not re-enter itself on emission failure (a stderr-unwritable satellite would infinite-loop otherwise; §3.3 satellite audit posture is best-effort). Prologue: push r12/r13/r14/r15 — four callee-save qwords, keeps rsp discipline consistent with the four-callee-save frame pattern in audit_hash_update; r15 in particular is pushed only as an alignment nicety alongside r14 since this function has one nested action (the `syscall` instruction, which is not a CALL and does not itself consume stack alignment, but the four-push symmetry keeps the frame shape auditable). Body: (1) mov r12, rdx (source payload cursor). (2) Copy the 31-byte prefix from sss_jsonl_prefix into the head of sss_jsonl_buffer via a byte-walk loop `mov_b rax, [rsi]; mov_b [r13], rax; add rsi, 1; add r13, 1; add rcx, 1; cmp rcx, 31; jb loop` — matches audit_marshal_string's byte-walk shape and sidesteps SIB U1606 by never using indexed addressing. After the loop r13 has advanced past the prefix and points to the hex region. (3) Hex-encode 256 bytes: xor r14, r14 (counter). Loop: cmp r14, 256; jae done. Load byte via `xor rax, rax; mov_b rax, [r12]; add r12, 1` (walking, not indexed). High nibble: `mov rcx, rax; shr rcx, 4`. Low nibble: `mov r8, rax; shl r8, 60; shr r8, 60` (shift-pair mask; equivalent to `and r8, 0xF` but uses only mnemonics already live in libpdx-audit — a conservative encoder posture; the identical shift-pair mask idea also appears implicitly across paideia-as's SDM-referenced arithmetic paths). Convert each nibble to ASCII: `cmp reg, 10; jae letter_path; add reg, 0x30; jmp done` else `letter_path: add reg, 0x57` (0x30 = '0', 0x57 = 'a' - 10 = 97 - 10; produces lowercase [0-9a-f]). Store both hex chars, advancing r13 by 1 after each. Increment r14; loop. (4) Copy 3-byte suffix same shape as prefix loop. (5) Linux write(2): mov rax, 1 (LINUX_SYS_WRITE); mov rdi, 2 (STDERR); lea rsi, [rip+sss_jsonl_buffer]; mov rdx, 546; syscall. (6) Epilogue: xor rax, rax (AUDIT_OK); pop r15/r14/r13/r12; ret. Effect tail !{mem, sysreg} @{} — the `syscall` instruction is what widens the effect set to include sysreg (matches kernel sys_ipc_send / sys_svc_lookup which declare !{mem, sysreg}); no paideia-os cap consumed. Callers with wider declared effects still typecheck. Cross-module symbols: none — every source and destination address is LEA'd from a symbol declared in THIS module. Immediates: 31 (prefix length), 256 (payload byte count and hex-loop bound), 3 (suffix length), 4 (high-nibble right-shift), 10 (nibble-letter discriminator), 60 (shl/shr paired shift for low-nibble mask), 0x30 ('0' base), 0x57 ('a' - 10), 1 (LINUX_SYS_WRITE + per-iteration walk step), 2 (STDERR fd), 546 (write buffer length: 31 + 512 + 3). All within the cmp-imm 0x7FFFFFFF bound. No test mnemonic; every zero-check is cmp reg, 0. No indexed byte addressing (`[base + idx * 1]` form) — every load/store uses a walking base register per the audit_marshal_string precedent, sidestepping SIB U1606. Label prefix sss_ per the reserved-label discipline (bare 'loop' / 'done' / 'letter' would collide with paideia-as keywords).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdx;                            // r12 = source payload cursor
+
+        // ---- Copy fixed 31-byte prefix into sss_jsonl_buffer ----------
+        lea r13, [rip + sss_jsonl_buffer];       // r13 = dest cursor
+        lea rsi, [rip + sss_jsonl_prefix];       // rsi = source cursor
+        xor rcx, rcx;                            // rcx = byte index
+
+      sss_prefix_loop:
+        cmp rcx, 31;
+        jae sss_prefix_done;
+
+        xor rax, rax;
+        mov_b rax, [rsi];
+        mov_b [r13], rax;
+        add rsi, 1;
+        add r13, 1;
+        add rcx, 1;
+        jmp sss_prefix_loop;
+
+      sss_prefix_done:
+        // r13 now sits at sss_jsonl_buffer + 31 (start of hex region).
+
+        // ---- Hex-encode 256 bytes from r12 into r13 -------------------
+        xor r14, r14;                            // r14 = hex byte index
+
+      sss_hex_loop:
+        cmp r14, 256;
+        jae sss_hex_done;
+
+        xor rax, rax;
+        mov_b rax, [r12];
+        add r12, 1;                              // advance source cursor
+
+        // High nibble in rcx.
+        mov rcx, rax;
+        shr rcx, 4;
+
+        // Low nibble in r8: shift-pair mask, equivalent to `and r8, 0xF`.
+        mov r8, rax;
+        shl r8, 60;
+        shr r8, 60;
+
+        // Emit high-nibble ASCII.
+        cmp rcx, 10;
+        jae sss_hi_letter;
+        add rcx, 0x30;                           // '0'..'9'
+        jmp sss_hi_store;
+      sss_hi_letter:
+        add rcx, 0x57;                           // 'a'..'f' (0x57 = 'a' - 10)
+      sss_hi_store:
+        mov_b [r13], rcx;
+        add r13, 1;
+
+        // Emit low-nibble ASCII.
+        cmp r8, 10;
+        jae sss_lo_letter;
+        add r8, 0x30;
+        jmp sss_lo_store;
+      sss_lo_letter:
+        add r8, 0x57;
+      sss_lo_store:
+        mov_b [r13], r8;
+        add r13, 1;
+
+        add r14, 1;
+        jmp sss_hex_loop;
+
+      sss_hex_done:
+        // ---- Copy fixed 3-byte suffix ---------------------------------
+        lea rsi, [rip + sss_jsonl_suffix];
+        xor rcx, rcx;
+
+      sss_suffix_loop:
+        cmp rcx, 3;
+        jae sss_suffix_done;
+
+        xor rax, rax;
+        mov_b rax, [rsi];
+        mov_b [r13], rax;
+        add rsi, 1;
+        add r13, 1;
+        add rcx, 1;
+        jmp sss_suffix_loop;
+
+      sss_suffix_done:
+        // ---- Linux write(2): write(2, sss_jsonl_buffer, 546) ----------
+        mov rax, 1;                              // LINUX_SYS_WRITE
+        mov rdi, 2;                              // STDERR_FILENO
+        lea rsi, [rip + sss_jsonl_buffer];
+        mov rdx, 546;                            // 31 + 512 + 3
+        syscall;
+
+        // ---- Return AUDIT_OK regardless of write(2) result ------------
+        xor rax, rax;                            // AUDIT_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // sys_getpid() -> u64
+  //   rax = caller's Linux pid
+  //
+  // Linux x86_64 getpid(2) trampoline (SYSCALL #39). The mnemonics
+  // look identical to the kernel sys_getpid because paideia-os
+  // assigned the getpid SC+ ID to 39 for reasons independent of
+  // Linux, and the numbers happen to coincide — the effect is a
+  // Linux vDSO getpid on the satellite path.
+  //
+  // Never returns 0 for a running process, so the caller's audit_
+  // process_pid lazy-init sentinel (`0 = "not yet fetched"`) remains
+  // well-defined on the satellite side too.
+  //
+  // Arity 0 — no SysV -> SYSCALL register shuffle.
+  // ============================================================================
+  pub let sys_getpid : () -> u64 !{sysreg} @{} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "libpdx-audit.LA.M2-004 (#19 Phase B): satellite sys_getpid. Linux x86_64 getpid(2) trampoline (SYSCALL #39). Zero-argument syscall — no SysV -> SYSCALL register shuffle needed (arity 0 < 4, same template class as sys_svc_lookup / sys_ipc_send). rax carries the caller's real Linux pid on return (never 0 for a running process on Linux, so remains a legal non-sentinel value for AuditClient::audit_begin's audit_process_pid cache — the #12 pid-composition depends on 0 being an unambiguous 'not yet fetched' marker). Effect tail !{sysreg} @{} matches the kernel sys_getpid signature exactly so the callsite in audit_client.pdx type-checks under both profiles without any change to audit_begin's own effect declaration. The number 39 coincides with paideia-os's SC+ ID for getpid — that coincidence is what makes this wrapper look identical to the kernel one — but the effect is a Linux vDSO getpid, not a paideia-os handler. Leaf trampoline; no callee-save touched, no push/pop.",
+      block: {
+        mov rax, 39;                             // LINUX_SYS_GETPID
+        syscall;
+        ret;
+      }
+    }
+}
