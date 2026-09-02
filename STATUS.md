@@ -1,8 +1,10 @@
 # libpdx-audit — status
 
 **Wave:** R49 shared library
-**Current milestone:** M5 (1.0 signed release) — landed
-**Version:** 1.0.0 (tag `v1.0.0`)
+**Current milestone:** Post-1.0.0 correctness + enhancement rollup
+(wire `@0.2` pair `#11`/`#12`, `ENH-003…008`, `LA.M1` `#20`–`#24`,
+`LA.M2` `#25`–`#29`) — all landed on `main`, rolling into v1.1.0.
+**Version:** 1.1.0 (pending tag; predecessor `v1.0.0` shipped 2026-08-22)
 
 ## Milestone progress
 
@@ -141,12 +143,54 @@ wave-level rationale and the full milestone breakdown. See
 
 ## Next milestone
 
-All milestones M1..M5 landed at v1.0.0. The library is now the
-template for the peer R49 shared-library M5 cuts (libpdx-cap,
-libpdx-argv, libpdx-semantic-pipe, libpdx-elevate). Downstream
-work continues in the consumer repos (pkg, shell, doc, the R50
-coreutils) where every M3 milestone binds libpdx-audit and every
-M5 cut mirrors the workflow at `release/RELEASE.md`.
+All milestones M1..M5 landed at v1.0.0. Post-v1.0.0, the following
+correctness + enhancement waves landed on `main` and roll into
+**v1.1.0** (2026-09-02, LA.M2-003 rollup; git tag `v1.1.0` applied
+by main at push time per the version-discipline convention):
+
+- **Wire-format `@0.2` (coordinated pair)** — `#11` (inline strings
+  in the audit record; `op_name` / `op_args` / `output_schema` no
+  longer travel as live sender-VA pointers meaningless outside the
+  process) and `#12` (globally-unique `audit_id` composed as
+  `(pid << 32) | local_id` via a new `sys_getpid` trampoline);
+  ships as a coordinated wire revision (see
+  `design/architecture.md` §12.6) with `AUDIT_PAYLOAD_BYTES` 64 →
+  256 and `AUDIT_HDR_WORD` `0x0000_0040_0000_0120` →
+  `0x0000010000000220` (payload_len 256, `ver` bumped 1 → 2).
+- **`ENH-*` pass (correctness + fail-closed defaults)** —
+  `ENH-003` (`audit_record_output` re-entrant from `OUTPUT`),
+  `ENH-004` (`audit_rearm` clears per-audit content slots between
+  audits in one long-lived process), `ENH-005`
+  (`audit_can_emit_output` fails closed by default: requires
+  broker-OK AND audit-open, not just broker-OK), `ENH-006`
+  (`audit_last_error` disambiguates `audit_begin`'s bare-0 return),
+  `ENH-007` (`caps.decl` refresh naming `AUDIT_HDR_WORD` framing
+  as mandatory), `ENH-008` (`audit_broker_failure_cause` +
+  sticky-failure recovery policy).
+- **`LA.M1` pass (correctness + test coverage)** — `#20`
+  (`audit_broker_bind` fast-path reset-skipped bug: two-compare
+  range gate `[1..255]`), `#21` (test-driver linker symbol
+  namespacing `TestBrokerRefusal::run` → `test_broker_refusal_run`
+  et al.), `#22` (`audit_last_error` test parity: 12 subtests),
+  `#23` (FNV-1a-64 known-vector correctness: 11 subtests), `#24`
+  (in-tree marshal harness: `tests/syscall_shim_stub.pdx` +
+  `tests/test_marshal_harness.pdx` with a hand-authored 256-byte
+  `@0.2` golden EXIT payload).
+- **`LA.M2` pass (release cut + doc drift)** — `#25`
+  (`manifest.pdxsig.txt` `audit-hdr-word` refreshed to the landed
+  `@0.2` value + `design/*.md` added to `[artifacts.doc]`), `#26`
+  (`pdxdoc` SYNOPSIS drift: `audit_can_emit_output` effect tail +
+  `audit_hash_init` return type both realigned to the landed
+  source), `#27` (v1.1.0 rollup — this entry), `#28`
+  (`design/architecture.md` §10 section reorder), `#29` (this
+  file's post-1.0.0 disclosure).
+
+The library remains the template for the peer R49 shared-library
+M5 cuts (libpdx-cap, libpdx-argv, libpdx-semantic-pipe,
+libpdx-elevate). Downstream work continues in the consumer repos
+(pkg, shell, doc, the R50 coreutils) where every M3 milestone binds
+libpdx-audit and every M5 cut mirrors the workflow at
+`release/RELEASE.md`.
 
 Deferred to a future patch release (semver-patch bump per
 `CHANGELOG.md` semver policy):

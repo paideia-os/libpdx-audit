@@ -1,12 +1,32 @@
 # libpdx-audit — CHANGELOG
 
-## Unreleased (post-v1.0.0 enhancement pass)
+## 1.1.0 — 2026-09-02
 
-Source-verified audit pass against the four real consumers (`rm`,
-`cp`, `pkg`, `ls`) plus a caps/wire-declaration review; see
-`design/enhancement-plan.md`. Entries below track individual
-`ENH-*` / `LA.M1-*` issues as they land; a version bump + CHANGELOG
-rollup happens at the next formal release cut.
+**Post-v1.0.0 correctness + enhancement rollup.** No wire-format major
+version bump (per `## Semver policy` on the v1.0.0 entry below, a wire
+grow past `[u64; 8]` — which `#11` + `#12` collectively performed —
+would be a major bump; this rollup ships as a minor because the wire
+grow was accompanied by the `AUDIT_HDR_WORD` `ver` field bumping 1 →
+2, giving a decoder a branch point, and no consumer-visible API
+signature or effect set was removed). Ships the source-verified audit
+pass against the four real consumers (`rm`, `cp`, `pkg`, `ls`) plus a
+caps/wire-declaration review; see `design/enhancement-plan.md`.
+
+Closed in this rollup, by wave:
+
+**Wire-format @0.2 (coordinated pair)** — `#11`, `#12`.
+
+**ENH pass (correctness + fail-closed defaults)** — `ENH-003`,
+`ENH-004`, `ENH-005`, `ENH-006`, `ENH-007`, `ENH-008`.
+
+**LA.M1 pass (correctness + test coverage)** — `#20`, `#21`, `#22`,
+`#23`, `#24`.
+
+**LA.M2 pass (release cut + doc drift)** — `#25`, `#26`, `#27`,
+`#28`, `#29`.
+
+Detailed entries below preserve the per-issue landing notes as
+originally recorded in the pre-v1.1.0 `Unreleased` section.
 
 - **#20** `LA.M1-001` — `AuditBroker::audit_broker_bind` fast-path
   reset-skipped bug. Pre-fix, `cmp rax, 0xFFFF; jne audit_bind_ok`
@@ -84,6 +104,50 @@ rollup happens at the next formal release cut.
   `test_replay_golden`) still link the real `syscall_shim.pdx` and
   MUST NOT link the stub. This is a link-time discipline convention
   documented in `tests/test_marshal_harness.pdx`'s module header.
+
+- **#25** `LA.M2-001` — `release/manifest.pdxsig.txt` `audit-hdr-word`
+  refresh: `0x0000_0040_0000_0120` (`@0.1` payload_len=64,
+  ver=1) → `0x0000010000000220` (`@0.2` payload_len=256, ver=2)
+  to match the landed `src/audit_record.pdx:52`
+  `AUDIT_HDR_WORD` constant post-`#11`/`#12`. Also added
+  `design/architecture.md` + `design/enhancement-plan.md` to
+  `[artifacts.doc]` so the release tool hashes them into the
+  signed manifest alongside `doc/libpdx-audit.pdxdoc`.
+- **#26** `LA.M2-002` — `doc/libpdx-audit.pdxdoc` SYNOPSIS
+  drift fix: `audit_can_emit_output`'s effect tail
+  `!{} @{}` → `!{mem} @{}` to match
+  `src/audit_client.pdx:412` (the sticky-flag + state-gate reads
+  are `.bss` loads); `audit_hash_init`'s return type
+  `u64` → `()` to match `src/audit_hash.pdx:66` (the entry point
+  seeds `.bss` and returns nothing — a caller that assigned its
+  return to a variable would have been reading an undefined
+  register). Pure doc fix; no code / wire change.
+- **#27** `LA.M2-003` — v1.1.0 rollup: `manifest.pdxsig.txt`
+  `package-version` 1.0.0 → 1.1.0, `source-tag` v1.0.0 → v1.1.0,
+  `source-commit` placeholder `<TAG-v1.0.0-COMMIT-SHA>` →
+  `<TAG-v1.1.0-COMMIT-SHA>` (release tool still fills in the real
+  SHA at cut time), `package-release` R49-M5 → R49-M5+LA.M1+LA.M2,
+  manifest source-form header banner + mirror URL comment bumped
+  to 1.1.0; `CHANGELOG.md` `Unreleased` header rolled up into
+  this `1.1.0 — 2026-09-02` entry with per-issue attribution for
+  every closed ticket. Git tag `v1.1.0` is applied by main at
+  push time (per the version-discipline convention).
+- **#28** `LA.M2-004` — `design/architecture.md` section reorder:
+  §10 (Cross-repo dependencies) had grown at the tail of the file
+  after §11/§12/§12.6/§13, breaking outline consumers that expect
+  monotonic ordering. Moved §10 into its canonical position between
+  §9 and §11 (single cut+paste; no numbering change, so all
+  cross-references keyed on `§N` still resolve). Final order is
+  §1→§2→…→§13 with §12.6 as a legitimate sub-heading under §12.
+- **#29** `LA.M2-005` — `STATUS.md` post-1.0.0 disclosure:
+  version line bumped 1.0.0 → 1.1.0 (pending tag); milestone
+  line updated from `M5 (1.0 signed release) — landed` to a
+  post-v1.0.0 correctness+enhancement-rollup summary; the
+  `## Next milestone` paragraph now names every issue landed
+  post-v1.0.0 (the wire-format @0.2 pair, the ENH-003…008 pass,
+  the LA.M1 correctness pass, the LA.M2 release-cut wave) so a
+  reader following STATUS.md as the entrypoint sees the full
+  scope of what v1.1.0 rolls up.
 
 - **#11 + #12** `PdxAuditRecord@0.1 → @0.2` — coordinated wire
   revision (shipped together deliberately; see

@@ -3,7 +3,7 @@
 %%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
 %%% §5.3); the M5-001 source lives in the repo under version control
 %%% and the release tool ships the compiled `.pdxdoc` alongside the
-%%% library into /pkgs/libpdx-audit-1.0.0/doc/libpdx-audit.pdxdoc.
+%%% library into /pkgs/libpdx-audit-1.1.0/doc/libpdx-audit.pdxdoc.
 %%%
 %%% Section markers: a bare `==== <title>` line opens a section. Cross-
 %%% references use `[[cref: <target>]]` where <target> is either a
@@ -24,12 +24,12 @@ libpdx-audit — audit-first output for paideia-os tools.
       pub let audit_record_output: (u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
       pub let audit_commit       : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched}
       pub let audit_set_parent   : (u64) -> u64 !{mem} @{}
-      pub let audit_can_emit_output : () -> u64 !{} @{}
+      pub let audit_can_emit_output : () -> u64 !{mem} @{}
       pub let audit_last_error   : () -> u64 !{mem} @{}
       pub let audit_broker_failure_cause : () -> u64 !{mem} @{}
     }
     module AuditHash = structure {
-      pub let audit_hash_init     : () -> u64 !{mem} @{}
+      pub let audit_hash_init     : () -> ()  !{mem} @{}
       pub let audit_hash_update   : (u64, u64) -> u64 !{mem} @{}
       pub let audit_hash_finalize : () -> u64 !{mem} @{}
     }
@@ -353,7 +353,18 @@ this repo. Wire-bytes fixture: `tests/goldens/trace_001.md`. Test
 protocol: `tests/README.md`.
 
 ==== VERSION
-libpdx-audit 1.0.0 (R49 wave, M5-001 signed release). Post-1.0.0,
-issues `#11` + `#12` land the `PdxAuditRecord@0.2` coordinated wire
-revision documented in [[cref: WIRE-FORMAT]] above; a version bump +
-CHANGELOG rollup happens at the next formal release cut.
+libpdx-audit 1.1.0 (2026-09-02, LA.M2-003 rollup). Rolls up the
+post-1.0.0 correctness/enhancement pass: `#11` + `#12` coordinated
+`PdxAuditRecord@0.1 → @0.2` wire revision documented in [[cref: WIRE-
+FORMAT]] above (256-byte hybrid record with inline strings + globally-
+unique `audit_id`); `ENH-003…008` API-surface widenings
+(`audit_record_output` re-entrant from OUTPUT, `audit_rearm`,
+fail-closed `audit_can_emit_output`, `audit_last_error`,
+`audit_broker_failure_cause`, `caps.decl` refresh); `#20..#24`
+LA.M1 correctness pass (broker-bind fast-path fix, test-driver symbol
+namespacing, `audit_last_error` + FNV-1a-64 known-vector test parity,
+in-tree marshal harness); `#25..#29` LA.M2 release-cut wave (this
+document's SYNOPSIS drift fix, manifest `audit-hdr-word` refresh, the
+v1.1.0 rollup itself, architecture.md section reorder, STATUS.md
+disclosure). Predecessor: 1.0.0 (2026-08-22, R49 wave, M5-001 signed
+release).

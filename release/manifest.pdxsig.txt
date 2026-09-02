@@ -1,4 +1,4 @@
-# libpdx-audit v1.0.0 — release manifest (source form)
+# libpdx-audit v1.1.0 — release manifest (source form)
 #
 # This is the human-readable source form of `manifest.pdxsig`. The
 # release tool at pkgs.paideia-os mirror-push time (a) enumerates the
@@ -10,7 +10,7 @@
 # the ML-DSA-65 secret key. The two detached signatures are appended
 # to the manifest in the fixed layout below and the resulting
 # `manifest.pdxsig` is pushed to
-#   https://pkgs.paideia-os/main/libpdx-audit/1.0.0/manifest.pdxsig
+#   https://pkgs.paideia-os/main/libpdx-audit/1.1.0/manifest.pdxsig
 # alongside the compiled artifacts.
 #
 # Reference:
@@ -26,18 +26,18 @@
 format-version:      1
 manifest-schema:     paideia-manifest-pdxsig@1
 package-name:        libpdx-audit
-package-version:     1.0.0
-package-release:     R49-M5
+package-version:     1.1.0
+package-release:     R49-M5+LA.M1+LA.M2
 package-license:     MIT
 source-repo:         https://github.com/paideia-os/libpdx-audit
-source-commit:       <TAG-v1.0.0-COMMIT-SHA>   # release tool fills in
-source-tag:          v1.0.0
+source-commit:       <TAG-v1.1.0-COMMIT-SHA>   # release tool fills in
+source-tag:          v1.1.0
 
 # ---------------------------------------------------------------
 # Artifact set — every file the compiled package ships. The hash
 # discipline is BLAKE3-256, upper 32 bytes rendered as 64 hex chars.
 # The release tool recomputes each hash from the working tree at the
-# v1.0.0 tag before writing the binary manifest. The order below is
+# v1.1.0 tag before writing the binary manifest. The order below is
 # stable (lexicographic within each section) so the concatenated
 # hash-input is reproducible across signers.
 # ---------------------------------------------------------------
@@ -51,6 +51,8 @@ src/audit_record.pdx             blake3-256 = <BLAKE3-audit_record.pdx>
 src/syscall_shim.pdx             blake3-256 = <BLAKE3-syscall_shim.pdx>
 
 [artifacts.doc]
+design/architecture.md           blake3-256 = <BLAKE3-architecture.md>
+design/enhancement-plan.md       blake3-256 = <BLAKE3-enhancement-plan.md>
 doc/libpdx-audit.pdxdoc          blake3-256 = <BLAKE3-libpdx-audit.pdxdoc>
 
 [artifacts.tests]
@@ -90,7 +92,7 @@ kernel-broker           = svc.audit-journal          # R49-PREP-006
 kernel-event-ordinals   = UEJ_KIND_TOOL_INVOKE=130,
                           UEJ_KIND_TOOL_OUTPUT=132,
                           UEJ_KIND_TOOL_EXIT=133     # R49-PREP-006
-audit-hdr-word          = 0x0000_0040_0000_0120     # payload_len=64
+audit-hdr-word          = 0x0000010000000220        # @0.2: op=0x20 | ver=2 | reply_ep=0 | payload_len=256 (was 0x0000_0040_0000_0120 @0.1 through v1.0.0; see src/audit_record.pdx:52 + design/architecture.md §12.6)
 
 # ---------------------------------------------------------------
 # Signature block — dual-signed per design/02-development-environment.md

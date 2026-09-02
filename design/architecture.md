@@ -380,6 +380,26 @@ Called out here so a reader of M1 code does not mistake absence for bug:
   IPC; the semantic-pipe binding via libpdx-semantic-pipe lands with
   the M3 line.
 
+## 10. Cross-repo dependencies
+
+Per r49-r50-plan.md §5.13:
+
+- **libpdx-audit.M1 depends on §5.0 R49-PREP-006** — the
+  `svc.audit-journal` broker registration seam + `UEJ_KIND_TOOL_*`
+  event constants at `src/kernel/core/ipc/audit_journal_broker.pdx`
+  in paideia-os (landed as commit `2ff76d4`, `Closes #1628`).
+- libpdx-audit.M2 depends on shell.M2 (parent-child linkage) and
+  libpdx-semantic-pipe.M2 (audit records travel on a semantic pipe).
+- libpdx-audit.M2 also depends on the R49-PREP-006 event constants
+  splitting into `UEJ_KIND_TOOL_INVOKE / OUTPUT / EXIT` (currently
+  a single INVOKE / EXIT pair with REMOVE / ERROR held for future
+  use); the split is deferred to R49-PREP-007.
+
+paideia-as ≥ v0.33 is required by the module encoder (needed for the
+`mov_b` narrow-load mnemonic and for the `@align` attribute on `.bss`
+slots). Older paideia-as revisions predate the #1248 mitigation and
+should not be used to build libpdx-audit.
+
 ## 11. M3-001 — streaming output-stream hash
 
 The M3-001 upgrade to `audit_record_output`'s `output_hash` slot: the
@@ -874,23 +894,3 @@ The QEMU harness memcmp's `audit_payload_scratch` against the
 concrete rows after each lifecycle send; symbolic rows are
 resolved against the harness's own linker map or computed
 independently.
-
-## 10. Cross-repo dependencies
-
-Per r49-r50-plan.md §5.13:
-
-- **libpdx-audit.M1 depends on §5.0 R49-PREP-006** — the
-  `svc.audit-journal` broker registration seam + `UEJ_KIND_TOOL_*`
-  event constants at `src/kernel/core/ipc/audit_journal_broker.pdx`
-  in paideia-os (landed as commit `2ff76d4`, `Closes #1628`).
-- libpdx-audit.M2 depends on shell.M2 (parent-child linkage) and
-  libpdx-semantic-pipe.M2 (audit records travel on a semantic pipe).
-- libpdx-audit.M2 also depends on the R49-PREP-006 event constants
-  splitting into `UEJ_KIND_TOOL_INVOKE / OUTPUT / EXIT` (currently
-  a single INVOKE / EXIT pair with REMOVE / ERROR held for future
-  use); the split is deferred to R49-PREP-007.
-
-paideia-as ≥ v0.33 is required by the module encoder (needed for the
-`mov_b` narrow-load mnemonic and for the `@align` attribute on `.bss`
-slots). Older paideia-as revisions predate the #1248 mitigation and
-should not be used to build libpdx-audit.
