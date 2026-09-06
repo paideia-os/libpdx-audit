@@ -1,4 +1,4 @@
-// tests/test_broker_refusal.pdx — libpdx-audit.M4-001 + ENH-005 + ENH-008 + LA.M1-002 (#21) + LA.M1-003 (#22)
+// tests/test_broker_refusal.pdx — libpdx-audit.M4-001 + ENH-005 + ENH-008 + LA.M1-002 (#21) + LA.M1-003 (#22) + #30
 // Driver for the D3 audit-first "broker unavailable → tool refuses
 // output (exit 3)" invariant. Verifies the M2-002 sticky-flag guard
 // AND the ENH-005 fail-open-when-no-audit-was-ever-begun fix end to
@@ -6,6 +6,19 @@
 // failure the kernel-side svc.audit-journal miss would otherwise
 // raise. See design/architecture.md §7 (send failure discipline) and
 // §13 (test discipline) for the invariant this covers.
+//
+// #30 adds subtest 13, a regression guard for the LA.M1-001 (#20)
+// audit_broker_bind fast-path fix: fault-inject audit_broker_slot=0
+// (the exact .bss-zero state a consumer that skips reset() would
+// observe on cold boot, since audit_broker_slot lives in .bss and
+// reset() is the only writer of its UNRESOLVED sentinel) and call
+// the REAL AuditBroker::audit_broker_bind entry point. No prior
+// subtest in this driver exercises audit_broker_bind itself — every
+// other subtest only reads/writes AuditRecord .bss directly — so a
+// future revert of the LA.M1-001 range gate back to its pre-fix
+// single `cmp rax, 0xFFFF; jne audit_bind_ok` form (which silently
+// treats .bss-zero as an already-bound slot and never calls
+// sys_svc_lookup) would pass every other subtest in this file.
 //
 // Return convention (matches every M4 test driver in this repo):
 //
@@ -15,18 +28,31 @@
 //                              stable across driver runs so a smoke
 //                              log can pinpoint which invariant broke).
 //
-// The driver is a pure leaf w.r.t. syscall: it never invokes
-// sys_ipc_send / sys_svc_lookup. This is deliberate — libpdx-audit
-// is a shared library with no runnable executable of its own, and
-// the M4-001 issue's real end-to-end check (spawn the driver as a
-// child of shell with no svc.audit-journal registered, verify the
-// child exits 3 and emits nothing) lives in the QEMU smoke matrix
-// once shell.M4 + a bootstrap consumer land. See tests/README.md
-// §M4-001 for the QEMU protocol; this file covers what can be
-// verified from the library's own type + memory surface.
+// The driver never invokes sys_ipc_send directly, and every subtest
+// but one never invokes sys_svc_lookup either. This is deliberate —
+// libpdx-audit is a shared library with no runnable executable of
+// its own, and the M4-001 issue's real end-to-end check (spawn the
+// driver as a child of shell with no svc.audit-journal registered,
+// verify the child exits 3 and emits nothing) lives in the QEMU
+// smoke matrix once shell.M4 + a bootstrap consumer land. See
+// tests/README.md §M4-001 for the QEMU protocol; this file covers
+// what can be verified from the library's own type + memory surface.
+// #30's subtest 13 is the one exception: it calls the REAL
+// AuditBroker::audit_broker_bind entry point (which transitively
+// invokes sys_svc_lookup) rather than fault-injecting a .bss state,
+// because no .bss assertion can distinguish "the fast path correctly
+// deferred to the slow path" from "the fast path never ran" — this
+// driver still links the real src/syscall_shim.pdx per its QEMU-
+// driver classification (never the tests/syscall_shim_stub.pdx
+// LA.M1-005 (#24) test double), so subtest 13 tolerates either real
+// sys_svc_lookup outcome; see the subtest's own comment for the
+// exact discriminator.
 //
-// Effects `!{mem} @{}` — pure .bss read/write across reset() and
-// audit_can_emit_output(); no syscall, no cap consumption. Consumers
+// Effects `!{mem, sysreg} @{cap}` — pure .bss read/write across
+// reset() and audit_can_emit_output() for every subtest but #30's
+// subtest 13, which calls audit_broker_bind (adds the {sysreg}
+// effect and the {cap} capability the type-checker infers from that
+// callee's own declared tail). Consumers
 // (the future pkg/shell test harness) link this and call
 // TestBrokerRefusal::test_broker_refusal_run() from their own
 // test-runner main. LA.M1-002 (#21): the entry point was renamed
@@ -46,6 +72,8 @@
 //   AuditClient::audit_broker_failure_cause (src/audit_client.pdx, ENH-008)
 //   AuditClient::audit_last_error    (src/audit_client.pdx, ENH-006 —
 //                                      new subtests 11+12, LA.M1-003)
+//   AuditBroker::audit_broker_bind   (src/audit_broker.pdx, LA.M1-001
+//                                      (#20) — new subtest 13, #30)
 // Cross-module .bss symbols read/written:
 //   audit_broker_failed              (src/audit_record.pdx, M2-002)
 //   audit_broker_failure_cause       (src/audit_record.pdx, ENH-008)
@@ -60,9 +88,9 @@ module TestBrokerRefusal = structure {
   // ============================================================================
   // test_broker_refusal_run() -> u64
   //
-  // Executes the M4-001 + ENH-005 + ENH-008 + LA.M1-003 subtest sequence
-  // in order. Returns 0 on all-pass or the ordinal of the first failing
-  // subtest (1..12). LA.M1-002 (#21) renamed the entry point from the
+  // Executes the M4-001 + ENH-005 + ENH-008 + LA.M1-003 + #30 subtest
+  // sequence in order. Returns 0 on all-pass or the ordinal of the first
+  // failing subtest (1..13). LA.M1-002 (#21) renamed the entry point from the
   // bare `run` to the namespaced `test_broker_refusal_run` so a test
   // runner that links this driver alongside another driver's `run`
   // no longer sees a symbol collision at link time.
@@ -111,10 +139,31 @@ module TestBrokerRefusal = structure {
   //                          audit_last_error (it does — src/audit_
   //                          record.pdx reset() explicitly zeroes the
   //                          slot on line 304).
+  //  13  (#30)           -> reset(); fault-inject audit_broker_slot = 0
+  //                          directly, OVERWRITING reset()'s own
+  //                          UNRESOLVED (0xFFFF) write — reproduces the
+  //                          exact .bss-zero state a consumer that skips
+  //                          reset() entirely observes on cold boot. Call
+  //                          the REAL AuditBroker::audit_broker_bind.
+  //                          Assert NOT (audit_broker_bind returned
+  //                          AUDIT_OK AND audit_broker_slot is still 0)
+  //                          — that specific combination is the one
+  //                          signature only the pre-LA.M1-001 fast-path
+  //                          bypass can produce (short-circuits straight
+  //                          to AUDIT_OK without ever calling
+  //                          sys_svc_lookup, so the fault-injected zero
+  //                          is never overwritten). Either a real
+  //                          AUDIT_ERR_BROKER_UNAVAILABLE (3) return or
+  //                          an AUDIT_OK return paired with a non-zero
+  //                          audit_broker_slot both prove the slow path
+  //                          actually ran sys_svc_lookup.
   //
   // Register plan (single leaf; no nested-call preservation needed since
-  // every callee is a pure leaf — reset, audit_can_emit_output —
-  // preserving no state across calls except .bss):
+  // every callee but #30's subtest 13 is a pure leaf — reset,
+  // audit_can_emit_output — preserving no state across calls except
+  // .bss; audit_broker_bind (subtest 13) also preserves no register
+  // state across its own internal sys_svc_lookup call per its own
+  // module header, so this driver's r12/r13 stay unused throughout):
   //   rax = call returns / .bss loads
   //   r11 = LEA scratch (paideia-as reserved)
   //   r12 = ordinal accumulator across the sequence (SysV callee-save;
@@ -127,10 +176,10 @@ module TestBrokerRefusal = structure {
   // that encodes as a sign-extended 32-bit immediate — legal.
   // ============================================================================
 
-  pub let test_broker_refusal_run : () -> u64 !{mem} @{} =
+  pub let test_broker_refusal_run : () -> u64 !{mem, sysreg} @{cap} =
     fn () -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M4-001 + ENH-005 + ENH-008 + LA.M1-002 (#21) + LA.M1-003 (#22): TestBrokerRefusal::test_broker_refusal_run entry point (renamed from the pre-LA.M1-002 bare `run` per #21 — namespaced so a test runner that links this driver alongside a sibling driver's `run` sees no linker-time symbol collision). Sequential subtest driver: twelve .bss-only checks against the AuditRecord state, the AuditClient::audit_can_emit_output guard, the AuditClient::audit_broker_failure_cause diagnostic accessor, and (LA.M1-003 new subtests 11+12) the AuditClient::audit_last_error diagnostic accessor, verifying the M2-002 sticky-flag invariant, the ENH-005 fail-closed-when-no-audit-is-open invariant, the ENH-008 failure-cause invariant, and the ENH-006 last-error invariant together. Subtest 2 and 6 assert the ENH-005 default: audit_can_emit_output() reads 0 immediately after reset() since record_state is IDLE (no audit open) even though audit_broker_failed is also 0 — this replaces the pre-ENH-005 expectation of 1 at those two points. Subtests 3 and 7 fault-inject record_state directly (AUDIT_STATE_BEGUN=1, then AUDIT_STATE_OUTPUT=2) to prove both legal 'audit open' states pass the guard when the sticky flag is clear. Subtest 4 fault-injects audit_broker_failed=1 while record_state is still BEGUN, proving the sticky flag outranks an open audit (matches audit_send_record's asr_bind_fail / asr_ipc_fail epilogue). Subtest 5 verifies reset() clears the sticky flag per the M2-002 doc line 'once set, only reset() clears it'. Subtest 8 verifies reset() writes AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) into audit_broker_slot — the M1-002 sentinel that gates the fast-path in audit_broker_bind (LA.M1-001 (#20) fix depends on the same sentinel: any value outside [1..255] forces the sys_svc_lookup slow path). Subtest 9 fault-injects audit_broker_failure_cause=AUDIT_ERR_SEND_FAILED(4) and verifies the new accessor returns it verbatim — the ENH-008 diagnostic path a supervisor uses to tell a send failure (asr_ipc_fail) apart from a bind failure (asr_bind_fail, cause=3). Subtest 10 verifies reset() also clears the cause slot alongside the sticky flag, per the ENH-008 sticky-forever-until-reset policy documented at design/architecture.md §7.2 (audit_rearm deliberately never clears either). LA.M1-003 (#22) subtest 11 exercises the audit_last_error accessor with the three real values audit_begin writes (AUDIT_ERR_STATE=1 from the IDLE-gate arm, AUDIT_ERR_BROKER_UNAVAILABLE=3 from the send-failure arm passthrough, AUDIT_ERR_SEND_FAILED=4 from the send-failure arm passthrough), fault-injecting each in turn and verifying the accessor round-trips it verbatim — symmetric to subtest 9 for audit_broker_failure_cause. Cycling three values in one subtest (rather than three ordinals for one value each) matches the shape subtest 9 uses and keeps the ordinal budget bounded; a failure in any of the three sub-checks fails ordinal 11. Subtest 12 verifies reset() zeroes audit_last_error to AUDIT_OK — symmetric to subtest 10 for audit_broker_failure_cause. Every call in this driver is a pure leaf (reset, audit_can_emit_output, audit_broker_failure_cause, audit_last_error all !{mem} @{}) so no register state needs preservation across calls beyond r12/r13 which are pushed for SysV callee-save discipline + rsp % 16 alignment parity — a future refactor that introduces a non-leaf could reuse the same pair. Label prefix tbr_ per project reserved-label discipline (labels using bare 'ok'/'fail' collide with paideia-as keywords; tbr_ prefix is unique). Return code: 0 on all-pass, 1..12 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (AUDIT_OK compare / .bss zero-check / refuse return), 1 (AUDIT_STATE_BEGUN / AUDIT_ERR_STATE fault-inject value / ordinals), 2 (AUDIT_STATE_OUTPUT), 3..12 (subtest ordinals + AUDIT_ERR_BROKER_UNAVAILABLE fault-inject + compare), 4 (AUDIT_ERR_SEND_FAILED fault-inject + compare value), 0xFFFF (AUDIT_BROKER_SLOT_UNRESOLVED) — all within paideia-as cmp-imm bounds.",
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "libpdx-audit.M4-001 + ENH-005 + ENH-008 + LA.M1-002 (#21) + LA.M1-003 (#22) + #30: TestBrokerRefusal::test_broker_refusal_run entry point (renamed from the pre-LA.M1-002 bare `run` per #21 — namespaced so a test runner that links this driver alongside a sibling driver's `run` sees no linker-time symbol collision). Sequential subtest driver: twelve .bss-only checks against the AuditRecord state, the AuditClient::audit_can_emit_output guard, the AuditClient::audit_broker_failure_cause diagnostic accessor, and (LA.M1-003 new subtests 11+12) the AuditClient::audit_last_error diagnostic accessor, plus (#30 new subtest 13) one syscall-touching check that calls the REAL AuditBroker::audit_broker_bind, verifying the M2-002 sticky-flag invariant, the ENH-005 fail-closed-when-no-audit-is-open invariant, the ENH-008 failure-cause invariant, the ENH-006 last-error invariant, and the LA.M1-001 (#20) bss-zero fast-path range-gate invariant together. Subtest 2 and 6 assert the ENH-005 default: audit_can_emit_output() reads 0 immediately after reset() since record_state is IDLE (no audit open) even though audit_broker_failed is also 0 — this replaces the pre-ENH-005 expectation of 1 at those two points. Subtests 3 and 7 fault-inject record_state directly (AUDIT_STATE_BEGUN=1, then AUDIT_STATE_OUTPUT=2) to prove both legal 'audit open' states pass the guard when the sticky flag is clear. Subtest 4 fault-injects audit_broker_failed=1 while record_state is still BEGUN, proving the sticky flag outranks an open audit (matches audit_send_record's asr_bind_fail / asr_ipc_fail epilogue). Subtest 5 verifies reset() clears the sticky flag per the M2-002 doc line 'once set, only reset() clears it'. Subtest 8 verifies reset() writes AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF) into audit_broker_slot — the M1-002 sentinel that gates the fast-path in audit_broker_bind (LA.M1-001 (#20) fix depends on the same sentinel: any value outside [1..255] forces the sys_svc_lookup slow path). Subtest 9 fault-injects audit_broker_failure_cause=AUDIT_ERR_SEND_FAILED(4) and verifies the new accessor returns it verbatim — the ENH-008 diagnostic path a supervisor uses to tell a send failure (asr_ipc_fail) apart from a bind failure (asr_bind_fail, cause=3). Subtest 10 verifies reset() also clears the cause slot alongside the sticky flag, per the ENH-008 sticky-forever-until-reset policy documented at design/architecture.md §7.2 (audit_rearm deliberately never clears either). LA.M1-003 (#22) subtest 11 exercises the audit_last_error accessor with the three real values audit_begin writes (AUDIT_ERR_STATE=1 from the IDLE-gate arm, AUDIT_ERR_BROKER_UNAVAILABLE=3 from the send-failure arm passthrough, AUDIT_ERR_SEND_FAILED=4 from the send-failure arm passthrough), fault-injecting each in turn and verifying the accessor round-trips it verbatim — symmetric to subtest 9 for audit_broker_failure_cause. Cycling three values in one subtest (rather than three ordinals for one value each) matches the shape subtest 9 uses and keeps the ordinal budget bounded; a failure in any of the three sub-checks fails ordinal 11. Subtest 12 verifies reset() zeroes audit_last_error to AUDIT_OK — symmetric to subtest 10 for audit_broker_failure_cause. #30 subtest 13 is this driver's one exception to 'every call is a pure leaf': after reset(), it fault-injects audit_broker_slot=0 directly (OVERWRITING reset()'s own UNRESOLVED write, reproducing the exact .bss-zero state a consumer that skips reset() observes on cold boot) and calls the real audit_broker_bind — the one subtest that actually exercises the LA.M1-001 (#20) range-gate logic rather than fault-injecting around it, because no .bss-only assertion can distinguish 'the fast path correctly deferred to sys_svc_lookup' from 'the fast path never ran at all'. audit_broker_bind itself does NOT write audit_broker_failure_cause (only audit_send_record's asr_bind_fail/asr_ipc_fail epilogues do — see src/audit_broker.pdx), so the discriminator subtest 13 uses is audit_broker_bind's OWN return value combined with the post-call audit_broker_slot state, not the failure_cause accessor: fail ONLY if rax==AUDIT_OK(0) AND audit_broker_slot is still 0 — that exact combination is the one signature the pre-fix single-compare-against-0xFFFF fast path produces (returns AUDIT_OK immediately without ever calling sys_svc_lookup, so the fault-injected zero is never overwritten); a genuine AUDIT_ERR_BROKER_UNAVAILABLE(3) return (slow path ran and a real lookup failed) or an AUDIT_OK return paired with a non-zero audit_broker_slot (slow path ran and a real lookup succeeded, storing a fresh slot) both prove the slow path actually executed. This driver still links the real src/syscall_shim.pdx (never tests/syscall_shim_stub.pdx) per its QEMU-driver classification in tests/README.md, so subtest 13's real sys_svc_lookup outcome depends on the runtime environment — the discriminator above is deliberately environment-independent. Every call in this driver except subtest 13's audit_broker_bind is a pure leaf (reset, audit_can_emit_output, audit_broker_failure_cause, audit_last_error all !{mem} @{}); audit_broker_bind is !{mem, sysreg} @{cap} per its own src/audit_broker.pdx declaration, which is why this driver's own tail widens from the pre-#30 !{mem} @{} to !{mem, sysreg} @{cap} — the type-checker inherits the widest callee tail regardless of whether subtest 13's real sys_svc_lookup call actually fires along a given path. No register state needs preservation across calls beyond r12/r13, which are pushed for SysV callee-save discipline + rsp % 16 alignment parity — audit_broker_bind's own frame preserves all callee-save registers per its module header, so r12/r13 stay unused through subtest 13 exactly as through every prior subtest. Label prefix tbr_ per project reserved-label discipline (labels using bare 'ok'/'fail' collide with paideia-as keywords; tbr_ prefix is unique) — subtest 13 adds tbr_13_pass and tbr_fail_13. Return code: 0 on all-pass, 1..13 = ordinal of first failing subtest. No test mnemonic; every zero-check is cmp reg, 0. Immediates: 0 (AUDIT_OK compare / .bss zero-check / refuse return / fault-injected bss-zero value), 1 (AUDIT_STATE_BEGUN / AUDIT_ERR_STATE fault-inject value / ordinals), 2 (AUDIT_STATE_OUTPUT), 3..13 (subtest ordinals + AUDIT_ERR_BROKER_UNAVAILABLE fault-inject/compare), 4 (AUDIT_ERR_SEND_FAILED fault-inject + compare value), 0xFFFF (AUDIT_BROKER_SLOT_UNRESOLVED) — all within paideia-as cmp-imm bounds.",
       block: {
         push r12;
         push r13;
@@ -272,6 +321,45 @@ module TestBrokerRefusal = structure {
         cmp rax, 0;
         jne tbr_fail_12;
 
+        // ---- Subtest 13 (#30): audit_broker_slot=0 bss-zero bypass
+        //      regression guard. reset(), then fault-inject
+        //      audit_broker_slot = 0 directly, OVERWRITING reset()'s
+        //      own UNRESOLVED (0xFFFF) write — reproduces the exact
+        //      .bss-zero state a consumer that skips reset() entirely
+        //      observes on cold boot. Call the REAL AuditBroker::
+        //      audit_broker_bind (not a .bss fault injection like
+        //      every subtest above) — the only way to prove the
+        //      LA.M1-001 (#20) two-compare range gate still forces
+        //      the sys_svc_lookup slow path on a bss-zero slot rather
+        //      than the pre-fix single-compare short circuit.
+        call reset;
+
+        xor rax, rax;                            // rax = 0 (bss-zero value)
+        lea r11, [rip + audit_broker_slot];
+        mov [r11], rax;                          // fault-inject: skip reset()'s UNRESOLVED write
+
+        call audit_broker_bind;
+
+        // ---- Discriminator: fail ONLY if audit_broker_bind returned
+        //      AUDIT_OK(0) while audit_broker_slot is STILL 0 — the
+        //      one signature the pre-fix fast path produces (short-
+        //      circuits straight to AUDIT_OK without ever calling
+        //      sys_svc_lookup, so the fault-injected zero survives
+        //      the call untouched). audit_broker_bind does NOT write
+        //      audit_broker_failure_cause itself (only audit_send_
+        //      record's failure epilogues do), so the failure_cause
+        //      accessor is not part of this discriminator.
+        cmp rax, 0;
+        jne tbr_13_pass;                         // rax == AUDIT_ERR_BROKER_UNAVAILABLE(3): slow path ran and failed cleanly
+
+        lea r11, [rip + audit_broker_slot];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne tbr_13_pass;                         // slot changed: slow path ran and cached a real slot
+
+        jmp tbr_fail_13;                         // AUDIT_OK returned AND slot still 0: fast path bypassed the fault injection
+
+      tbr_13_pass:
         // All subtests passed.
         xor rax, rax;                            // 0 = all pass
         pop r13;
@@ -346,6 +434,12 @@ module TestBrokerRefusal = structure {
 
       tbr_fail_12:
         mov rax, 12;
+        pop r13;
+        pop r12;
+        ret;
+
+      tbr_fail_13:
+        mov rax, 13;
         pop r13;
         pop r12;
         ret;

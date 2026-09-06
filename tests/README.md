@@ -18,11 +18,17 @@ Both landed at M4.
   driver alongside a sibling `run` sees no symbol collision).
   Verifies the M2-002 sticky-flag guard, the ENH-005 fail-closed-
   when-no-audit-is-open guard, the ENH-008 failure-cause
-  diagnostic accessor, and (LA.M1-003 (#22) subtests 11+12) the
-  ENH-006 `audit_last_error` diagnostic accessor end-to-end at the
-  API surface via .bss fault-injection. Returns 0 on pass or a
-  1..12 subtest ordinal on failure. Pure leaf (effects `!{mem}
-  @{}` — no syscall).
+  diagnostic accessor, (LA.M1-003 (#22) subtests 11+12) the
+  ENH-006 `audit_last_error` diagnostic accessor, and (#30 subtest
+  13) the LA.M1-001 (#20) `audit_broker_bind` bss-zero fast-path
+  range gate, end-to-end at the API surface. Returns 0 on pass or a
+  1..13 subtest ordinal on failure. Effects `!{mem, sysreg} @{cap}`
+  — subtests 1..12 are pure `.bss` fault-injection (no syscall);
+  subtest 13 (#30) is the one exception, calling the REAL
+  `audit_broker_bind` (still linked against the real
+  `src/syscall_shim.pdx`, never the stub — see below) because no
+  `.bss`-only assertion can distinguish "the fast path correctly
+  deferred to `sys_svc_lookup`" from "the fast path never ran".
 - `test_replay_golden.pdx` — M4-002 driver. Exports
   `TestReplayGolden::test_replay_golden_run() -> u64` (renamed per
   LA.M1-002 (#21)). Verifies the wire-format invariants that a
@@ -107,6 +113,30 @@ link-line discipline described in the driver's module header
 (never link the stub alongside the real trampolines; never link
 the M4 drivers with the stub).
 
+**#30 exception.** `test_broker_refusal`'s subtest 13 calls the
+REAL `AuditBroker::audit_broker_bind` (which transitively invokes
+`sys_svc_lookup`) rather than fault-injecting around it, because no
+`.bss`-only assertion can prove the LA.M1-001 (#20) range gate
+still forces the `sys_svc_lookup` slow path on a `.bss`-zero
+`audit_broker_slot` — every earlier subtest either never touches
+that slot or only checks the sentinel `reset()` itself writes
+(subtest 8), so none of them would catch a future revert of the
+gate back to its pre-fix single-compare form. Unlike
+`test_marshal_harness`, this subtest does NOT link the stub —
+`test_broker_refusal` keeps its QEMU-driver classification (real
+`src/syscall_shim.pdx`) so the M4-001 QEMU protocol below is
+unaffected. Since a real `sys_svc_lookup` may legitimately succeed
+or fail depending on whether `svc.audit-journal` is registered in
+whatever environment runs this driver, subtest 13's assertion is
+deliberately environment-independent: it fails only on the one
+`.bss` signature — `audit_broker_bind` returned `AUDIT_OK` AND
+`audit_broker_slot` is still the fault-injected `0` — that a
+bypassed fast path (and only a bypassed fast path) can produce. In
+a bare test-run without a kernel, this subtest's `sys_svc_lookup`
+call would trap exactly as `test_marshal_harness`'s calls would
+without the stub; both drivers only actually execute inside the
+QEMU protocol described below or a future kernel-linked runner.
+
 ## QEMU smoke protocol (deferred)
 
 The full M4 smoke matrix — spawn a bootstrap consumer under QEMU,
@@ -134,7 +164,12 @@ Once those three are in place, the smoke matrix runs:
    endpoint has zero write rights).
 2. Spawn the bootstrap consumer with the driver linked in.
 3. Consumer runs `TestBrokerRefusal::test_broker_refusal_run()`;
-   if != 0, exit that ordinal.
+   if != 0, exit that ordinal. (#30: subtest 13 already attempts a
+   real `audit_broker_bind` here — in this no-broker environment
+   `sys_svc_lookup` fails and the subtest expects
+   `AUDIT_ERR_BROKER_UNAVAILABLE`, which also leaves
+   `audit_broker_slot` at its fault-injected `0` for step 4's fixture
+   to re-attempt.)
 4. Consumer then runs the failure-path fixture from
    `goldens/trace_001.md` — attempts a full three-call audit.
 5. Assertions:
