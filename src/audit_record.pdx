@@ -14,6 +14,27 @@ module AuditRecord = structure {
   pub let AUDIT_ERR_SEND_FAILED        : u64 = 4   // sys_ipc_send non-zero return
   pub let AUDIT_ERR_HASH_INACTIVE      : u64 = 5   // audit_hash_update without prior audit_hash_init (M3-001)
 
+  // --- LE.M2-002 leaf-primitive error codes (issue #31). ----------------
+  //     AuditClient::audit_append_leaf returns 0 = accepted, negative =
+  //     refused — the org-standard negative-errno convention (the same
+  //     one audit_begin's own doc comment contrasts itself against:
+  //     "unlike every other IPC-adjacent shim in this org, which returns
+  //     negative-errno"). audit_append_leaf is a brand-new entry point
+  //     with no wire-stable 0-sentinel history to preserve, so it is
+  //     free to follow the org norm rather than inherit audit_begin's
+  //     historical quirk. Three distinct causes so a caller (libpdx-
+  //     elevate) can log something more useful than one opaque refusal.
+  pub let AUDIT_LEAF_ERR_NULL_BUFFER      : u64 = 0xFFFFFFFFFFFFFFFF  // -1: buffer_ptr == 0
+  pub let AUDIT_LEAF_ERR_BAD_LENGTH       : u64 = 0xFFFFFFFFFFFFFFFE  // -2: buffer_len outside [16, 128]
+  pub let AUDIT_LEAF_ERR_SINK_UNAVAILABLE : u64 = 0xFFFFFFFFFFFFFFFD  // -3: audit_broker_slot not yet bound
+
+  // --- LE.M2-002 leaf-record length bounds (issue #31). audit_append_
+  //     leaf accepts any caller-composed record in this byte range —
+  //     wide enough to cover both a 32-byte and a 64-byte fixed shape a
+  //     caller might standardise on, without this library dictating one.
+  pub let AUDIT_LEAF_MIN_BYTES : u64 = 16
+  pub let AUDIT_LEAF_MAX_BYTES : u64 = 128
+
   // --- State machine values written to record_state. --------------------
   pub let AUDIT_STATE_IDLE      : u64 = 0
   pub let AUDIT_STATE_BEGUN     : u64 = 1
@@ -230,6 +251,41 @@ module AuditRecord = structure {
   pub let mut audit_payload_scratch : [u8; 256] = uninit @align(8)
   pub let mut audit_hdr_scratch     : u64       = uninit @align(8)
 
+  // --- LE.M2-002 leaf staging slots (issue #31). AuditClient::audit_
+  //     append_leaf is a `!{mem} @{}`-only primitive libpdx-elevate
+  //     calls from its own !{mem}-effect bodies without widening its own
+  //     effect tail. sys_ipc_send is NEVER declared narrower than
+  //     `!{mem, sysreg}` under either build profile (kernel additionally
+  //     carries @{cap, sched}; even the satellite trampoline in
+  //     syscall_shim_satellite.pdx still carries {sysreg} for its own
+  //     Linux syscall instruction) — so audit_append_leaf cannot call
+  //     sys_ipc_send, or AuditBroker::audit_broker_bind's slow path
+  //     (which itself calls sys_svc_lookup, `!{mem, sysreg} @{cap}`),
+  //     without breaking its own declared !{mem} @{} tail. It therefore
+  //     does not attempt delivery at all: it stages the caller's exact
+  //     bytes here, verbatim, with zero enrichment, and returns. Actual
+  //     transport to svc.audit-journal remains the job of the existing
+  //     widened-effect AuditBroker::audit_send_record path (reached via
+  //     audit_begin / audit_record_output / audit_commit); a future
+  //     milestone may add a companion widened-effect "drain" entry point
+  //     that reads audit_leaf_pending / audit_leaf_scratch_len /
+  //     audit_leaf_scratch and forwards the staged bytes — out of scope
+  //     for #31, which only needs the !{mem}-only append side to unblock
+  //     libpdx-elevate's LE.M2-002 build.
+  //
+  //     Single-slot staging (one leaf record at a time, matching the
+  //     rest of AuditRecord's singleton-per-process shape): a second
+  //     accepted audit_append_leaf call before any future drain
+  //     overwrites the first. audit_leaf_pending flags "there is
+  //     unconsumed staged content"; audit_leaf_scratch_len records how
+  //     many of the 128 bytes are meaningful — audit_append_leaf zero-
+  //     pads the remainder on every accepted write, matching the zero-
+  //     pad discipline AuditBroker::audit_marshal_string already uses
+  //     for its own inline string fields.
+  pub let mut audit_leaf_scratch     : [u8; 128] = uninit @align(8)
+  pub let mut audit_leaf_scratch_len : u64       = uninit @align(8)
+  pub let mut audit_leaf_pending     : u64       = uninit @align(8)
+
   // audit_rearm() — ENH-004 (post-1.0.0). Clears the per-audit
   // CONTENT slots that a previous audit's audit_record_output /
   // audit_commit may have populated — record_exit_code,
@@ -287,7 +343,7 @@ module AuditRecord = structure {
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001 + M3-002 + ENH-006 + ENH-008: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). M3-002 adds record_parent_audit_id to the zero pass so a consumer that never calls audit_set_parent gets parent = 0 (top-level) in its wire records, preserving the M2 shape. ENH-006 adds audit_last_error to the zero pass so a fresh process reads AUDIT_OK (0) from audit_last_error before any audit_begin call, matching the 'no failure yet' meaning. ENH-008 adds audit_broker_failure_cause to the zero pass alongside audit_broker_failed — both are sticky-forever by explicit policy (design/architecture.md §7.2) and only reset() clears either. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-audit.M1-001 + M1-002 + M2-002 + M3-001 + M3-002 + ENH-006 + ENH-008: zero the in-progress bookkeeping slots so a fresh audit_begin starts from a known-idle state, then seed audit_id_next=1 (so the first handed-out id is 1, leaving 0 as the reserved 'no audit' sentinel) and audit_broker_slot=AUDIT_BROKER_SLOT_UNRESOLVED (0xFFFF). M2-002 adds audit_broker_failed to the zero pass so a re-init after a failed audit gets a clean slate. M3-001 adds record_hash_state + record_hash_active to the zero pass so a fresh reset() gives audit_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior audit within the same process). M3-002 adds record_parent_audit_id to the zero pass so a consumer that never calls audit_set_parent gets parent = 0 (top-level) in its wire records, preserving the M2 shape. ENH-006 adds audit_last_error to the zero pass so a fresh process reads AUDIT_OK (0) from audit_last_error before any audit_begin call, matching the 'no failure yet' meaning. ENH-008 adds audit_broker_failure_cause to the zero pass alongside audit_broker_failed — both are sticky-forever by explicit policy (design/architecture.md §7.2) and only reset() clears either. LE.M2-002 (#31) adds audit_leaf_pending + audit_leaf_scratch_len to the zero pass so a fresh process reads 'no leaf record staged' before any audit_append_leaf call, even though .bss zero-init already implies the same default — defence-in-depth matching every other slot's explicit re-init here; audit_leaf_scratch's raw bytes are left untouched since audit_append_leaf always overwrites and re-pads the full 128 bytes on every accepted call, so there is nothing stale to clear until the length tracker says otherwise. r11 is scratch (paideia-as conformance). rax=0 is the value written into each zero slot; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. The two sentinel writes are separate mov rax,imm; mov [r11],rax pairs so the immediates stay ≤ 0x7FFFFFFF (both do: 1 and 0xFFFF are 32-bit-safe). Leaf function — no callee-save touched, no push/pop.",
       block: {
         xor rax, rax;                                    // rax = 0
         lea r11, [rip + record_audit_id];          mov [r11], rax;
@@ -303,6 +359,8 @@ module AuditRecord = structure {
         lea r11, [rip + record_parent_audit_id];   mov [r11], rax;
         lea r11, [rip + audit_last_error];         mov [r11], rax;
         lea r11, [rip + audit_broker_failure_cause]; mov [r11], rax;
+        lea r11, [rip + audit_leaf_pending];       mov [r11], rax;      // LE.M2-002 (#31)
+        lea r11, [rip + audit_leaf_scratch_len];   mov [r11], rax;      // LE.M2-002 (#31)
 
         mov rax, 1;                                      // audit_id_next = 1
         lea r11, [rip + audit_id_next];            mov [r11], rax;
