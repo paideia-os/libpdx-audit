@@ -46,7 +46,6 @@ capability set, both as declared on the `pub let`.
 | `audit_commit(audit_id, exit_code) -> u64 !{mem, sysreg} @{cap, sched}` | Close the audit. Legal from BEGUN or OUTPUT; stores `exit_code`, transitions to COMMITTED, emits `UEJ_KIND_TOOL_EXIT`, and on success resets state to IDLE so a later `audit_begin` starts fresh. On failure state stays COMMITTED for post-mortem. |
 | `audit_can_emit_output() -> u64 !{mem} @{}` | The D3 output gate: returns `1` only when the sticky `audit_broker_failed` flag is clear **and** an audit is actually open (`record_state` is `BEGUN` or `OUTPUT`); returns `0` — caller must `exit 3` emitting nothing — otherwise, including when no audit was ever begun or one already committed (post-1.0.0 fail-closed fix, ENH-005). |
 | `audit_set_parent(parent_audit_id) -> u64 !{mem} @{}` | Set the parent linkage before `audit_begin`. Gated on state == IDLE (`AUDIT_ERR_STATE` otherwise) — parent id is part of the audit's identity, not mutable mid-flight. `0` means top-level. |
-| `audit_append_leaf(buffer_ptr, buffer_len) -> u64 !{mem} @{}` | LE.M2-002 (`#31`). Thin `!{mem}`-only leaf so a caller like libpdx-elevate can journal a caller-composed record (16..128 bytes, zero enrichment) without adopting the trio's widened `!{mem, sysreg} @{cap, sched}` tail. Validates the buffer, then checks — without attempting to resolve — whether `audit_broker_slot` is already bound; an unresolved sink fails closed (`AUDIT_LEAF_ERR_SINK_UNAVAILABLE`) rather than blocking. On success, stages the bytes verbatim into `audit_leaf_scratch` (zero-padding the tail) and sets `audit_leaf_pending`. Returns `0` on success, or a negative `AUDIT_LEAF_ERR_*` code. Does **not** deliver to `svc.audit-journal` — see the "Not a delivery primitive" note below. |
 
 ### `src/audit_hash.pdx` — `AuditHash` (streaming output digest)
 
@@ -95,11 +94,6 @@ Exported constants:
 - Error codes — `AUDIT_OK` 0, `AUDIT_ERR_STATE` 1,
   `AUDIT_ERR_ID_MISMATCH` 2, `AUDIT_ERR_BROKER_UNAVAILABLE` 3,
   `AUDIT_ERR_SEND_FAILED` 4, `AUDIT_ERR_HASH_INACTIVE` 5.
-- `audit_append_leaf` error codes (LE.M2-002, `#31` — negative-errno
-  convention, distinct from the positive `AUDIT_ERR_*` codes above) —
-  `AUDIT_LEAF_ERR_NULL_BUFFER` -1, `AUDIT_LEAF_ERR_BAD_LENGTH` -2,
-  `AUDIT_LEAF_ERR_SINK_UNAVAILABLE` -3. Length bounds —
-  `AUDIT_LEAF_MIN_BYTES` 16, `AUDIT_LEAF_MAX_BYTES` 128.
 - States — `AUDIT_STATE_IDLE` 0, `BEGUN` 1, `OUTPUT` 2, `COMMITTED` 3.
 - Wire — `AUDIT_PAYLOAD_BYTES` 256, `AUDIT_HDR_WORD`
   `0x0000010000000220` (post-1.0.0, `@0.2` — was 64 /
@@ -127,28 +121,6 @@ zeroing, unless noted): `audit_id_next`, `record_audit_id`,
 see `design/architecture.md` §12.6.2), plus the send scratch
 `audit_payload_scratch : [u8; 256]` (post-1.0.0, `@0.2`; was
 `[u64; 8]`) and `audit_hdr_scratch : u64`.
-
-LE.M2-002 (`#31`) adds three more `.bss` slots feeding
-`audit_append_leaf` alone (untouched by the `audit_begin`/
-`_record_output`/`_commit` trio): `audit_leaf_scratch : [u8; 128]`
-(the staged record bytes, zero-padded past the accepted length),
-`audit_leaf_scratch_len : u64` (how many of those 128 bytes are
-meaningful), and `audit_leaf_pending : u64` (`1` once a record has been
-staged; `reset()` zeroes both `audit_leaf_pending` and
-`audit_leaf_scratch_len`, though `.bss` zero-init already implies the
-same default).
-
-**Not a delivery primitive.** `audit_append_leaf` never calls
-`AuditBroker::audit_send_record`, `audit_broker_bind`, or
-`sys_ipc_send` — none of those are ever declared narrower than
-`!{mem, sysreg}` under either build profile, so calling any of them
-would widen `audit_append_leaf` past its own declared `!{mem} @{}`
-tail, defeating the point of the primitive. It only stages the bytes;
-actual transport to `svc.audit-journal` remains the existing
-widened-effect `audit_send_record` path. A future milestone may add a
-companion widened-effect drain entry point that reads
-`audit_leaf_pending` / `audit_leaf_scratch_len` / `audit_leaf_scratch`
-and forwards it — out of scope for `#31`.
 
 ### `src/syscall_shim.pdx` — `SyscallShim`
 

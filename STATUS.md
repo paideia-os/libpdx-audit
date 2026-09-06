@@ -1,17 +1,13 @@
 # libpdx-audit — status
 
-**Wave:** R49 shared library + R91-XREPO.M1 satellite runtime shim +
-cross-repo unblockers
-**Current milestone:** `audit_append_leaf` `!{mem}`-only leaf primitive
-(`LE.M2-002` closing `#31`) — landed on `main`, rolling into v1.2.0.
-Filed as a cross-repo unblocker for `paideia-os/libpdx-elevate#38`.
-Satellite runtime shim (R91-XREPO.M1 Phase B, `LA.M2-004` closing
-`#19`) landed at v1.1.1 (2026-09-02); post-1.0.0 correctness +
-enhancement rollup (wire `@0.2` pair `#11`/`#12`, `ENH-003…008`,
-`LA.M1` `#20`–`#24`, `LA.M2` `#25`–`#29`) landed at v1.1.0
-(2026-09-02).
-**Version:** 1.2.0 (pending tag; predecessors: `v1.1.1` 2026-09-02,
-`v1.1.0` 2026-09-02, `v1.0.0` 2026-08-22)
+**Wave:** R49 shared library + R91-XREPO.M1 satellite runtime shim
+**Current milestone:** Satellite runtime shim (R91-XREPO.M1 Phase B,
+`LA.M2-004` closing `#19`) — landed on `main`, rolling into v1.1.1.
+Post-1.0.0 correctness + enhancement rollup (wire `@0.2` pair
+`#11`/`#12`, `ENH-003…008`, `LA.M1` `#20`–`#24`, `LA.M2` `#25`–`#29`)
+already landed at v1.1.0 (2026-09-02).
+**Version:** 1.1.1 (pending tag; predecessors: `v1.1.0` 2026-09-02,
+`v1.0.0` 2026-08-22)
 
 ## Milestone progress
 
@@ -270,40 +266,9 @@ libpdx-elevate). Downstream work continues in the consumer repos
 libpdx-audit and every M5 cut mirrors the workflow at
 `release/RELEASE.md`.
 
-## `audit_append_leaf` leaf primitive (LE.M2-002, v1.2.0)
-
-Closes `#31`, filed as a cross-repo unblocker for
-`paideia-os/libpdx-elevate#38` (LE.M2-002). `AuditClient::
-audit_append_leaf(buffer_ptr, buffer_len) -> u64 !{mem} @{}` in
-`src/audit_client.pdx` lets a `!{mem}`-effect caller append one
-caller-composed audit record (16..128 bytes, no enrichment) without
-adopting the full trio's `!{mem, sysreg} @{cap, sched}` tail. It cannot
-call `audit_broker_bind` or `sys_ipc_send` without widening past its
-own declared tail, so it stages into new `AuditRecord::
-audit_leaf_scratch` / `audit_leaf_scratch_len` / `audit_leaf_pending`
-`.bss` slots instead of delivering — checking (without resolving)
-whether `audit_broker_slot` is already bound, and failing closed
-(`AUDIT_LEAF_ERR_SINK_UNAVAILABLE`) rather than blocking when it is
-not. See `CHANGELOG.md`'s 1.2.0 entry for the full shape; see
-`src/audit_client.pdx`'s own doc comment for the design rationale.
-
-Semver posture: minor. Additive-only; the existing `audit_begin` /
-`audit_record_output` / `audit_commit` trio and every prior signature
-are untouched.
-
 Deferred to a future patch release (semver-patch bump per
 `CHANGELOG.md` semver policy):
 
-- **`audit_append_leaf` drain primitive.** A widened-effect entry
-  point (or a hook inside the existing `audit_send_record` path) that
-  reads `audit_leaf_pending` / `audit_leaf_scratch_len` /
-  `audit_leaf_scratch` and forwards the staged bytes over
-  `sys_ipc_send`. Out of scope for `#31`, which only needed the
-  `!{mem}`-only append side to unblock libpdx-elevate's LE.M2-002
-  build; today a staged leaf record is retained in `.bss` until a
-  consumer wires up a drain, mirroring the library's existing
-  reality that the kernel-side `audit_journal_broker_dispatch` is
-  still a stub for the full API too.
 - **BLAKE3 stdlib primitive swap.** M3-001 ships FNV-1a-64 as a
   documented placeholder. When paideia-as ≥ v0.34 exposes BLAKE3
   as a stdlib intrinsic, swap `audit_hash_update` +

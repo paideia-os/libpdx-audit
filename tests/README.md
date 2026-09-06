@@ -66,21 +66,6 @@ Both landed at M4.
   `test_replay_golden`) link the real `src/syscall_shim.pdx` and
   must not link this file. See the file's module header for the
   substitution rationale.
-- `test_append_leaf.pdx` — LE.M2-002 (`#31`) driver. Exports
-  `TestAppendLeaf::test_append_leaf_run() -> u64`. Exercises
-  `AuditClient::audit_append_leaf` end to end: null-buffer refusal,
-  undersized/oversized length refusal (both boundary sides of
-  `[AUDIT_LEAF_MIN_BYTES=16, AUDIT_LEAF_MAX_BYTES=128]`),
-  sink-unavailable fail-close under both the `.bss`-zero and the
-  explicit `AUDIT_BROKER_SLOT_UNRESOLVED` (`0xFFFF`) sentinel,
-  a byte-for-byte accepted-write verification (including the
-  zero-padded tail past the accepted length) against a fault-injected
-  valid kernel cap slot, and acceptance under the
-  `AuditBrokerSatellite` bind sentinel (`0xFFFE`). Returns 0 on pass or
-  a 1..7 subtest ordinal on failure. Pure leaf (effects `!{mem} @{}`)
-  — `audit_append_leaf` never calls `audit_broker_bind` or
-  `sys_ipc_send`, so this driver needs no syscall shim at all, real or
-  stubbed.
 - `goldens/trace_001.md` — the M4-002 wire-bytes fixture
   (`PdxAuditRecord@0.2`, post-1.0.0 issues `#11` + `#12`: 256-byte
   hybrid payload + header layout, per INVOKE / OUTPUT / EXIT

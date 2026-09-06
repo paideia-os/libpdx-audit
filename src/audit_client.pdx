@@ -27,11 +27,7 @@
 //   audit_last_error accessor), audit_broker_failure_cause (ENH-008
 //   read in the new audit_broker_failure_cause accessor; written by
 //   AuditBroker::audit_send_record), audit_process_pid (#12 lazy-init
-//   cache written + read by audit_begin), audit_broker_slot (LE.M2-002
-//   #31, read-only in audit_append_leaf — never written; the leaf only
-//   checks whether a prior audit_broker_bind already resolved it),
-//   audit_leaf_scratch / audit_leaf_scratch_len / audit_leaf_pending
-//   (LE.M2-002 #31, written by audit_append_leaf)
+//   cache written + read by audit_begin)
 // Cross-module functions called:
 //   audit_send_record  (src/audit_broker.pdx, M2-001)
 //   audit_rearm        (src/audit_record.pdx, ENH-004, called from
@@ -40,11 +36,6 @@
 //                        from audit_begin at most once per process)
 // Resolved by unqualified linker name — the same pattern
 // libpdx-argv's parser.pdx uses to read ParsedArgs::flag_count.
-//
-// LE.M2-002 (#31): audit_append_leaf calls NOTHING cross-module — it is
-// a pure .bss read/write leaf by design (see its own doc comment below
-// for why it cannot call audit_broker_bind or sys_ipc_send without
-// breaking its declared !{mem} @{} tail).
 //
 // #12 (audit_id global uniqueness): audit_begin now composes the wire
 // audit_id as `(pid << 32) | local_id` rather than handing out the
@@ -586,163 +577,6 @@ module AuditClient = structure {
 
       asp_bad_state:
         mov rax, 1;                              // AUDIT_ERR_STATE
-        ret;
-      }
-    }
-
-  // ============================================================================
-  // audit_append_leaf(buffer_ptr, buffer_len) -> u64
-  //   rdi = buffer_ptr    (caller-owned, caller-composed audit-record
-  //                        bytes; MUST be non-zero)
-  //   rsi = buffer_len    (bytes to copy; MUST be in
-  //                        [AUDIT_LEAF_MIN_BYTES=16, AUDIT_LEAF_MAX_BYTES=128])
-  //   rax = 0                                  on success (staged)
-  //       | AUDIT_LEAF_ERR_NULL_BUFFER   (-1)  buffer_ptr == 0
-  //       | AUDIT_LEAF_ERR_BAD_LENGTH    (-2)  buffer_len outside [16, 128]
-  //       | AUDIT_LEAF_ERR_SINK_UNAVAILABLE (-3) audit_broker_slot not
-  //                                             yet resolved by any
-  //                                             prior audit_broker_bind
-  //
-  // LE.M2-002 (paideia-os/libpdx-audit#31). Thin `!{mem}`-only leaf
-  // primitive so libpdx-elevate can journal from its own `!{mem}`-effect
-  // bodies (its `elevate_client_journal_req/_apr/_op`) without
-  // propagating the widened `!{mem, sysreg} @{cap, sched}` tail the full
-  // audit_begin/_record_output/_commit trio carries. See issue #31 for
-  // the full cross-repo rationale (paideia-os/libpdx-elevate#38,
-  // LE.M2-002).
-  //
-  // Caller composes the ENTIRE record — this leaf performs NO
-  // enrichment (no timestamp, no source-cap resolution, no op_name/
-  // op_args marshalling) and issues NO callback, continuation, or
-  // dispatch. The bytes are copied verbatim, byte-for-byte, into
-  // AuditRecord::audit_leaf_scratch and the accepted length recorded in
-  // audit_leaf_scratch_len; audit_leaf_pending is set to 1.
-  //
-  // NOT a delivery primitive. It cannot call AuditBroker::
-  // audit_send_record, AuditBroker::audit_broker_bind (kernel profile:
-  // `!{mem, sysreg} @{cap}`), or SyscallShim::sys_ipc_send (`!{mem,
-  // sysreg} @{cap, sched}` kernel / `!{mem, sysreg} @{}` satellite —
-  // NEVER narrower than `{mem, sysreg}` under either profile) without
-  // widening its own declared `!{mem} @{}` tail, which is the entire
-  // point of this primitive's existence. It therefore only STAGES the
-  // record; a future widened-effect "drain" entry point (out of scope
-  // for #31) is the natural place to actually forward
-  // audit_leaf_scratch over IPC. This mirrors the library's own current
-  // reality that the kernel-side audit_journal_broker_dispatch is still
-  // a stub (AJB_DISPATCH_STUB) — end-to-end persistence is not live for
-  // the full API either yet.
-  //
-  // Gates, in order: (1) buffer_ptr non-null; (2) buffer_len in
-  // [16, 128]; (3) the sink slot is already resolved. Gate 3 reads
-  // AuditRecord::audit_broker_slot directly — it does NOT call
-  // audit_broker_bind — so an unresolved slot fails closed immediately
-  // rather than attempting (and blocking on) a fresh sys_svc_lookup;
-  // this is the "fail-close rather than blocking" discipline #31
-  // specifies, and it is exactly what preserves this leaf's !{mem} @{}
-  // posture on the failure path. A slot is "resolved" when it is either
-  // a valid kernel cap slot in [1..255] (AuditBroker::audit_broker_bind,
-  // src/audit_broker.pdx) or the satellite bind sentinel
-  // AUDIT_BROKER_SLOT_SATELLITE=0xFFFE (AuditBrokerSatellite::
-  // audit_broker_bind, src/audit_broker_satellite.pdx) — .bss-zero
-  // (never touched) and AUDIT_BROKER_SLOT_UNRESOLVED=0xFFFF (reset()'s
-  // sentinel) both fail closed, as does any stray negative-errno
-  // leftover (>= 256 and != 0xFFFE).
-  //
-  // Register plan (pure leaf; zero nested calls, so no SysV rsp % 16
-  // alignment concern anywhere in this function):
-  //   rdi = buffer_ptr argument, then mutated in place as the copy
-  //         loop's source cursor (matches AuditBroker::
-  //         audit_marshal_string's src-cursor idiom — no further use of
-  //         the original pointer value is needed once the gates pass)
-  //   rsi = buffer_len argument (read-only)
-  //   r9  = buffer_len, staged once into a scratch register so rsi can
-  //         stay untouched while rcx counts the copy loop
-  //   rcx = byte index (0 .. 128)
-  //   r10 = destination cursor, walks audit_leaf_scratch
-  //   rax = byte scratch during the copy/pad loops (zero-extended via
-  //         the paideia-as #1248 xor+mov_b pattern before every load,
-  //         matching audit_marshal_string), reused as the .bss-slot
-  //         load in gate 3, and as the return value
-  //   r11 = LEA scratch (paideia-as reserved)
-  // ============================================================================
-
-  pub let audit_append_leaf : (u64, u64) -> u64 !{mem} @{} =
-    fn (buffer_ptr: u64) (buffer_len: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "paideia-os/libpdx-audit#31 (LE.M2-002 unblock): audit_append_leaf entry point. Three gates in order, matching the doc comment above: (1) buffer_ptr (rdi) non-null via `cmp rdi, 0; je aal_err_null` (no test mnemonic per paideia-as conformance); (2) buffer_len (rsi) in [AUDIT_LEAF_MIN_BYTES=16, AUDIT_LEAF_MAX_BYTES=128] via `cmp rsi, 16; jb aal_err_badlen` then `cmp rsi, 128; ja aal_err_badlen`; (3) AuditRecord::audit_broker_slot already resolved, read directly via `lea r11,[rip+audit_broker_slot]; mov rax,[r11]` — deliberately NOT a call to AuditBroker::audit_broker_bind, whose slow path issues sys_svc_lookup (`!{mem, sysreg} @{cap}` even under the satellite profile's fail-open stub the effect tail differs from this leaf's own) which would widen this function's effect tail past its declared `!{mem} @{}`. The range check mirrors audit_broker_bind's own fast-path gate (src/audit_broker.pdx audit_bind_ok) plus the AuditBrokerSatellite sentinel: `cmp rax, 0; je aal_err_unavailable` (bss-zero, never touched) then `cmp rax, 256; jb aal_slot_ok` (valid kernel cap slot) then `cmp rax, 0xFFFE; je aal_slot_ok` (AUDIT_BROKER_SLOT_SATELLITE) else `jmp aal_err_unavailable` (catches 0xFFFF UNRESOLVED and any stray negative-errno leftover >= 256). Gate 3 failing fails closed immediately with AUDIT_LEAF_ERR_SINK_UNAVAILABLE (-3) WITHOUT attempting resolution — the 'fail-close rather than blocking' discipline #31 specifies, and the only reason this function's failure path can stay effect-free. On all three gates passing (aal_slot_ok): stage rsi into r9 (loop bound), zero rcx (byte index), LEA r10 to audit_leaf_scratch (dst cursor). Copy loop (aal_copy_loop): while rcx < r9, zero-extend-load one byte from [rdi] into rax (`xor rax,rax; mov_b rax,[rdi]` — paideia-as #1248 mitigation, matches audit_marshal_string's audit_broker.pdx shape), store to [r10], advance rdi/r10/rcx by 1 each via `add reg, 1` (never indexed addressing, sidestepping the SIB-scale-fold bug U1606 per the same precedent), loop. Pad loop (aal_pad): while rcx < 128 (AUDIT_LEAF_MAX_BYTES), zero-fill [r10] and advance r10/rcx by 1, loop — guarantees every one of the 128 audit_leaf_scratch bytes past buffer_len is zero on every accepted call, not just the ones from a shorter previous write. On pad completion (aal_stage_done): store r9 (buffer_len) into audit_leaf_scratch_len, write 1 into audit_leaf_pending, zero rax, return AUDIT_OK (0). No enrichment anywhere in this path — the caller's bytes are copied exactly as given, no timestamp, no source-cap resolution, no header composition. This function calls nothing cross-module and issues no syscall, so no SysV rsp % 16 alignment discipline is needed at any point — unlike every other entry point in this file, it never has to push/pop a callee-save pair for a nested call. Effects `!{mem} @{}` — every operation is a load or store to either the caller's own buffer (already validated non-null before any dereference) or AuditRecord's own .bss region; no syscall, no cap consumption, no scheduling interaction. Label prefix aal_ per the project reserved-label discipline (bare 'ok'/'done'/'fail' collide with paideia-as keywords). No test mnemonic; every zero-check is cmp reg, 0. No `and`; the return-code negative constants are loaded via a single `mov r64, imm32` sign-extended to 64 bits (0xFFFFFFFFFFFFFFFF/FE/FD all sign-extend cleanly from their low 32 bits, matching the existing `mov rax, 0xFFFFFFFFFFFFFFFF` precedent already used for negative sentinels elsewhere in paideia-os, e.g. src/tools/mkfs-pdxb/uuid.pdx and src/kernel/core/fs/fd_table.pdx). No `add reg, [mem]` anywhere — every add is reg+imm. Immediates: 0 (null check / bss-zero slot check / AUDIT_OK), 16 (AUDIT_LEAF_MIN_BYTES), 128 (AUDIT_LEAF_MAX_BYTES, used both as the upper length gate and the pad-loop bound), 256 (kernel cap-slot range discriminator, same constant audit_broker_bind's own fast path uses), 0xFFFE (AUDIT_BROKER_SLOT_SATELLITE), 1 (audit_leaf_pending accepted value) — all within the 0x7FFFFFFF cmp-imm bound; the three negative return codes are 32-bit-sign-extend-safe per the paragraph above.",
-      block: {
-        // ---- Gate 1: buffer_ptr must be non-null. ----------------------
-        cmp rdi, 0;
-        je aal_err_null;
-
-        // ---- Gate 2: buffer_len must be in [16, 128]. -------------------
-        cmp rsi, 16;                              // AUDIT_LEAF_MIN_BYTES
-        jb aal_err_badlen;
-        cmp rsi, 128;                             // AUDIT_LEAF_MAX_BYTES
-        ja aal_err_badlen;
-
-        // ---- Gate 3: grab the sink slot — pure .bss read, no bind
-        //      attempt (that would call sys_svc_lookup and widen this
-        //      leaf's effect tail). Unresolved -> fail closed now.
-        lea r11, [rip + audit_broker_slot];
-        mov rax, [r11];
-        cmp rax, 0;                               // .bss-zero = never bound
-        je aal_err_unavailable;
-        cmp rax, 256;                             // valid kernel cap slot range
-        jb aal_slot_ok;
-        cmp rax, 0xFFFE;                          // AUDIT_BROKER_SLOT_SATELLITE
-        je aal_slot_ok;
-        jmp aal_err_unavailable;                  // 0xFFFF UNRESOLVED or neg-errno leftover
-
-      aal_slot_ok:
-        // ---- Stage the caller's exact bytes, byte-for-byte. -------------
-        mov r9, rsi;                              // r9 = buffer_len (loop bound)
-        xor rcx, rcx;                             // byte index = 0
-        lea r10, [rip + audit_leaf_scratch];      // r10 = dst cursor
-
-      aal_copy_loop:
-        cmp rcx, r9;
-        jae aal_pad;
-
-        xor rax, rax;
-        mov_b rax, [rdi];
-        mov_b [r10], rax;
-        add rdi, 1;
-        add r10, 1;
-        add rcx, 1;
-        jmp aal_copy_loop;
-
-      aal_pad:
-        cmp rcx, 128;                             // AUDIT_LEAF_MAX_BYTES
-        jae aal_stage_done;
-
-        xor rax, rax;
-        mov_b [r10], rax;
-        add r10, 1;
-        add rcx, 1;
-        jmp aal_pad;
-
-      aal_stage_done:
-        lea r11, [rip + audit_leaf_scratch_len];
-        mov [r11], r9;
-
-        mov rax, 1;
-        lea r11, [rip + audit_leaf_pending];
-        mov [r11], rax;
-
-        xor rax, rax;                             // AUDIT_OK (accepted)
-        ret;
-
-      aal_err_null:
-        mov rax, 0xFFFFFFFFFFFFFFFF;              // AUDIT_LEAF_ERR_NULL_BUFFER (-1)
-        ret;
-
-      aal_err_badlen:
-        mov rax, 0xFFFFFFFFFFFFFFFE;              // AUDIT_LEAF_ERR_BAD_LENGTH (-2)
-        ret;
-
-      aal_err_unavailable:
-        mov rax, 0xFFFFFFFFFFFFFFFD;              // AUDIT_LEAF_ERR_SINK_UNAVAILABLE (-3)
         ret;
       }
     }
