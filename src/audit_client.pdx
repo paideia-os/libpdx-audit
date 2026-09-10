@@ -580,4 +580,105 @@ module AuditClient = structure {
         ret;
       }
     }
+
+  // ============================================================================
+  // audit_append_leaf(buf, buf_len, entry_ptr) -> u64
+  //   rdi = buf         (caller-owned destination buffer, 8-byte aligned)
+  //   rsi = buf_len     (remaining destination CAPACITY in bytes; must
+  //                       be >= AUDIT_PAYLOAD_BYTES (256). Callers with
+  //                       a rolling write cursor pass (total - written).)
+  //   rdx = entry_ptr   (pre-composed 256-byte PdxAuditRecord@0.2 record
+  //                       laid out per the AUDIT_OFF_* offset table; the
+  //                       leaf does NOT validate the field shape, it
+  //                       copies bytes as-is)
+  //   rax = AUDIT_OK (0)                on success (256 bytes copied)
+  //       | AUDIT_ERR_BUFFER_FULL (6)   if buf_len < AUDIT_PAYLOAD_BYTES
+  //                                     — fail-closed with ZERO bytes
+  //                                     written (per the #31 issue's
+  //                                     "fail-close if the underlying
+  //                                     sink transport is unavailable
+  //                                     rather than blocking" clause: a
+  //                                     buffer that cannot hold the
+  //                                     record is a sink not accepting
+  //                                     the write)
+  //
+  // #31 cross-repo unblocker for libpdx-elevate LE.M2-002. The three
+  // AuditClient lifecycle entry points (audit_begin / audit_record_
+  // output / audit_commit) carry effect tail `!{mem, sysreg} @{cap,
+  // sched}` — audit_begin issues sys_getpid and the trio's IPC send
+  // touches audit_broker_slot (cap) and sched_wake (sysreg + sched).
+  // libpdx-elevate's `elevate_client_journal_req/_apr/_op` bodies carry
+  // `!{mem} @{}`; adopting the trio would propagate the wider tail up
+  // through every downstream elevate entry point — a v2.0 wire break,
+  // not the additive v1.x swap LE.M2-002 targets.
+  //
+  // audit_append_leaf preserves `!{mem} @{}` by doing NOTHING beyond
+  // the bounded byte copy: no sys_ipc_send (no sysreg, no sched), no
+  // sys_svc_lookup (no cap), no timestamp injection or source-cap
+  // resolution (those enrichments are what pushed the trio to the
+  // wider tail — kept out of this leaf on purpose per the issue's
+  // "not attempt to enrich the record" clause).
+  //
+  // The caller composes the whole 256-byte record in its own owned
+  // memory (typical shape: a `[u8; 256] @align(8)` .bss slot or stack
+  // local, matching AuditRecord::audit_payload_scratch's declaration),
+  // fills the AUDIT_OFF_* fields itself, then calls this leaf to
+  // append the record into the caller-managed sink buffer. A wrapper
+  // caller with the wider effect tail can later transport the sink
+  // buffer to svc.audit-journal via AuditBroker::audit_send_record
+  // (or equivalent), but that transport step is not this leaf's job.
+  //
+  // Contract:
+  //   * buf and entry_ptr MUST be 8-byte aligned. Caller obligation;
+  //     the leaf uses qword loads/stores and does not fault on
+  //     misalignment (x86-64 permits unaligned qword access), but a
+  //     misaligned pointer degrades performance and violates the
+  //     documented shape. Typical satisfaction: `[u8; N] @align(8)`
+  //     for .bss, or a stack local (SysV keeps rsp 16-byte aligned
+  //     at every call boundary).
+  //   * NULL for either pointer is a caller contract violation and
+  //     is NOT guarded — matches every other cross-module byte-copy
+  //     primitive in this repo. (audit_marshal_string only checks
+  //     src == 0 as a defined empty-string sentinel, never dst.)
+  //   * The leaf writes exactly AUDIT_PAYLOAD_BYTES (256) bytes on
+  //     success and ZERO bytes on the AUDIT_ERR_BUFFER_FULL path —
+  //     no partial writes.
+  //
+  // Pure leaf; no callee-save touched, no nested call.
+  // ============================================================================
+
+  pub let audit_append_leaf : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf: u64) (buf_len: u64) (entry_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-audit.#31 (cross-repo unblocker for libpdx-elevate LE.M2-002): audit_append_leaf entry point. Pure in-memory byte-copy primitive appending one pre-composed AUDIT_PAYLOAD_BYTES (256) PdxAuditRecord@0.2 record from entry_ptr into the caller-owned destination buffer at buf; buf_len is the destination's remaining CAPACITY in bytes (not its total size — the caller advances its own write cursor across successive calls). Rationale: libpdx-elevate's `elevate_client_journal_req/_apr/_op` bodies carry effect tail `!{mem} @{}` (svc-emit journal shape, no syscall, no cap consume); adopting the full AuditClient::audit_begin/_record_output/_commit trio would propagate the trio's real `!{mem, sysreg} @{cap, sched}` tail up through every downstream elevate entry point — a v2.0 wire break, not the additive v1.x swap LE.M2-002 targets. This leaf preserves `!{mem} @{}` by doing NOTHING beyond the bounded byte copy: no sys_ipc_send (no sysreg, no sched), no sys_svc_lookup (no cap), no timestamp injection or source-cap resolution (those enrichments are what pushed the trio to its wider tail — audit_begin issues sys_getpid, audit_send_record issues sys_ipc_send + touches audit_broker_slot cap). Contract: (1) buf_len MUST be >= AUDIT_PAYLOAD_BYTES (256); on shortfall return AUDIT_ERR_BUFFER_FULL (6, new code added in AuditRecord alongside HASH_INACTIVE=5) with ZERO bytes written — fail-closed per the issue's `fail-close if the underlying sink transport is unavailable rather than blocking` clause (a buffer that cannot hold the record is a sink not accepting the write). (2) entry_ptr MUST point to a caller-composed 256-byte record laid out per the PdxAuditRecord@0.2 offset table (AUDIT_OFF_AUDIT_ID/EVENT_KIND/EXIT_CODE/PARENT_ID/OUTPUT_HASH/OP_NAME/OP_ARGS/OUTPUT_SCHEMA/RESERVED) — the leaf does NOT validate the shape, it copies bytes as-is per the issue's `caller marshals the fields; leaf writes as-is` clause. (3) Both pointers MUST be 8-byte aligned (typical: a caller-side `[u8; 256] @align(8)` .bss or stack allocation, matching the AuditRecord::audit_payload_scratch declaration in this repo). x86-64 permits unaligned qword access without fault, so misalignment does not fail-hard but violates the documented shape and degrades performance. (4) NULL pointer for buf or entry_ptr is a caller contract violation and is NOT guarded — matches every other cross-module byte-copy primitive in this repo (audit_marshal_string only checks src == 0 as a defined empty-string sentinel, never dst). Copy shape: 256 bytes = 32 qwords, in a single counted loop (`mov rcx, 32; loop: mov rax, [rdx]; mov [rdi], rax; add rdx, 8; add rdi, 8; sub rcx, 1; cmp rcx, 0; jne loop`) rather than 256 byte iterations — an 8x reduction in loop overhead given the aligned-pointer contract. Both endpoint pointers (rdi/rdx) are SysV caller-save and this function makes NO nested call, so mutating them across the copy is safe. rsi (buf_len) is only used at the entry gate; no need to preserve. Pure leaf — no push/pop, no callee-save touched, no branch beyond the gate + loop test. Register plan: rdi = buf (mutated to walk destination), rsi = buf_len (read once at gate), rdx = entry_ptr (mutated to walk source), rcx = loop counter (32..0), rax = copy scratch + return. Effects `!{mem} @{}` — pure memory read (from entry_ptr) + write (to buf), no syscall, no cap consumption. Label prefix aal_ per the reserved-label discipline (bare loop/full/done collide with paideia-as keywords). Immediates: 256 (buffer-capacity gate), 32 (loop iteration count), 8 (per-iteration pointer advance), 0 (loop-exit compare + AUDIT_OK), 6 (AUDIT_ERR_BUFFER_FULL) — all within the 0x7FFFFFFF cmp-imm bound. No test mnemonic; every zero-check is `cmp reg, 0`; jb (unsigned below) discriminates the buffer-capacity gate cleanly since buf_len is u64.",
+      block: {
+        // ---- Gate: caller-owned destination buffer must have capacity
+        //      for one full AUDIT_PAYLOAD_BYTES record (256 bytes).
+        //      Fail-closed with ZERO bytes written on shortfall. --------
+        cmp rsi, 256;
+        jb  aal_buffer_full;
+
+        // ---- Copy 256 bytes = 32 qwords from entry_ptr (rdx) to buf
+        //      (rdi). Both pointers are 8-byte aligned by caller
+        //      contract; no nested call, so mutating rdi/rdx directly
+        //      is safe (both are SysV caller-save). --------------------
+        mov rcx, 32;
+
+      aal_copy_loop:
+        mov rax, [rdx];
+        mov [rdi], rax;
+        add rdx, 8;
+        add rdi, 8;
+        sub rcx, 1;
+        cmp rcx, 0;
+        jne aal_copy_loop;
+
+        xor rax, rax;                            // AUDIT_OK
+        ret;
+
+      aal_buffer_full:
+        mov rax, 6;                              // AUDIT_ERR_BUFFER_FULL
+        ret;
+      }
+    }
 }

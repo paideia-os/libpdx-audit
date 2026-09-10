@@ -1,5 +1,63 @@
 # libpdx-audit — CHANGELOG
 
+## Unreleased
+
+**`audit_append_leaf` primitive (cross-repo unblocker for
+libpdx-elevate LE.M2-002).** Closes `#31`. Additive, source-only —
+zero wire-format change, zero effect-tail change on any existing entry
+point.
+
+- **New API** (`src/audit_client.pdx`):
+  `audit_append_leaf(buf, buf_len, entry_ptr) -> u64 !{mem} @{}`.
+  Pure in-memory byte-copy primitive: appends one pre-composed 256-byte
+  `PdxAuditRecord@0.2` record from `entry_ptr` into the caller-owned
+  destination buffer at `buf`. `buf_len` is the destination's
+  remaining CAPACITY in bytes (callers with a rolling write cursor
+  pass `total - written`). No syscall, no cap consume, no timestamp
+  injection or source-cap resolution — the leaf preserves `!{mem} @{}`
+  precisely so a `!{mem}`-tail caller (e.g. libpdx-elevate's
+  `elevate_client_journal_req/_apr/_op` bodies) can invoke it without
+  widening its own declared effect set. The full `audit_begin` /
+  `audit_record_output` / `audit_commit` trio stays as the
+  enrichment-carrying API for callers that already carry
+  `sysreg`/`cap`/`sched`.
+
+- **New error code** (`src/audit_record.pdx`):
+  `AUDIT_ERR_BUFFER_FULL = 6`, returned by `audit_append_leaf` when
+  `buf_len < AUDIT_PAYLOAD_BYTES` (256) with ZERO bytes written —
+  fail-closed per the `#31` issue's "fail-close if the underlying
+  sink transport is unavailable rather than blocking" clause.
+
+- **Alignment math:** 256 bytes / 8 bytes per qword = 32 iterations.
+  The copy is a single counted qword loop (`mov rcx, 32; loop: mov
+  rax, [rdx]; mov [rdi], rax; add rdx, 8; add rdi, 8; sub rcx, 1;
+  cmp rcx, 0; jne loop`) rather than a 256-iteration byte loop — an
+  8x reduction in loop overhead given the caller-obligation of
+  8-byte-aligned `buf` / `entry_ptr` (typical satisfaction:
+  `[u8; N] @align(8)` .bss or a stack local since SysV keeps `rsp`
+  16-byte aligned at every call boundary). x86-64 permits unaligned
+  qword access without fault, so misalignment does not fail-hard but
+  degrades performance and violates the documented shape.
+
+- **Contract:** the leaf writes exactly 256 bytes on success and ZERO
+  bytes on the `AUDIT_ERR_BUFFER_FULL` path — no partial writes.
+  NULL `buf`/`entry_ptr` is a caller contract violation and is NOT
+  guarded (matches every other cross-module byte-copy primitive in
+  this repo — `audit_marshal_string` only checks `src == 0` as a
+  defined empty-string sentinel, never `dst`). The leaf does NOT
+  validate the record's field shape; the caller is responsible for
+  laying out the 256-byte buffer per the `AUDIT_OFF_*` offset table.
+
+- **Consumption from libpdx-elevate:** downstream v1.x callers with
+  `!{mem} @{}` effect tail can now marshal a `PdxAuditRecord@0.2` in
+  their own owned memory and hand it to this leaf without the trio's
+  effect-tail widening. A separate `!{mem, sysreg} @{cap, sched}`
+  wrapper caller transports the accumulated sink buffer to
+  `svc.audit-journal` when needed.
+
+Semver posture: patch (`1.1.1` → `1.1.2`). Purely additive — no
+existing signature, effect set, wire header, or payload byte moves.
+
 ## 1.1.1 — 2026-09-02
 
 **Satellite runtime shim (R91-XREPO.M1 Phase B).** Closes `#19` — the

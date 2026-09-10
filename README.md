@@ -46,6 +46,7 @@ capability set, both as declared on the `pub let`.
 | `audit_commit(audit_id, exit_code) -> u64 !{mem, sysreg} @{cap, sched}` | Close the audit. Legal from BEGUN or OUTPUT; stores `exit_code`, transitions to COMMITTED, emits `UEJ_KIND_TOOL_EXIT`, and on success resets state to IDLE so a later `audit_begin` starts fresh. On failure state stays COMMITTED for post-mortem. |
 | `audit_can_emit_output() -> u64 !{mem} @{}` | The D3 output gate: returns `1` only when the sticky `audit_broker_failed` flag is clear **and** an audit is actually open (`record_state` is `BEGUN` or `OUTPUT`); returns `0` — caller must `exit 3` emitting nothing — otherwise, including when no audit was ever begun or one already committed (post-1.0.0 fail-closed fix, ENH-005). |
 | `audit_set_parent(parent_audit_id) -> u64 !{mem} @{}` | Set the parent linkage before `audit_begin`. Gated on state == IDLE (`AUDIT_ERR_STATE` otherwise) — parent id is part of the audit's identity, not mutable mid-flight. `0` means top-level. |
+| `audit_append_leaf(buf, buf_len, entry_ptr) -> u64 !{mem} @{}` | Post-1.1.1 (`#31`, cross-repo unblocker for libpdx-elevate LE.M2-002). Pure in-memory byte-copy leaf: appends one caller-composed 256-byte `PdxAuditRecord@0.2` from `entry_ptr` into the caller-owned buffer at `buf`. `buf_len` is remaining CAPACITY in bytes (callers with a rolling write cursor pass `total - written`). No syscall, no cap consume, no enrichment (no timestamp, no source-cap resolution) — preserves `!{mem} @{}` so a `!{mem}`-tail caller can invoke it without widening its own effect set. Returns `AUDIT_ERR_BUFFER_FULL` (6, new code) with ZERO bytes written when `buf_len < 256`. `buf`/`entry_ptr` must be 8-byte aligned; NULL is a caller contract violation and is not guarded (matches every other cross-module byte-copy primitive in this repo). Leaf writes exactly 256 bytes on success and 0 on the buffer-full path — no partial writes. The full `audit_begin` / `audit_record_output` / `audit_commit` trio stays as the enrichment-carrying API for callers that already carry `sysreg`/`cap`/`sched`. |
 
 ### `src/audit_hash.pdx` — `AuditHash` (streaming output digest)
 
@@ -93,7 +94,9 @@ Exported constants:
 
 - Error codes — `AUDIT_OK` 0, `AUDIT_ERR_STATE` 1,
   `AUDIT_ERR_ID_MISMATCH` 2, `AUDIT_ERR_BROKER_UNAVAILABLE` 3,
-  `AUDIT_ERR_SEND_FAILED` 4, `AUDIT_ERR_HASH_INACTIVE` 5.
+  `AUDIT_ERR_SEND_FAILED` 4, `AUDIT_ERR_HASH_INACTIVE` 5,
+  `AUDIT_ERR_BUFFER_FULL` 6 (post-1.1.1, `#31` —
+  `audit_append_leaf` returns this when `buf_len < AUDIT_PAYLOAD_BYTES`).
 - States — `AUDIT_STATE_IDLE` 0, `BEGUN` 1, `OUTPUT` 2, `COMMITTED` 3.
 - Wire — `AUDIT_PAYLOAD_BYTES` 256, `AUDIT_HDR_WORD`
   `0x0000010000000220` (post-1.0.0, `@0.2` — was 64 /

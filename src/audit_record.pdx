@@ -13,6 +13,7 @@ module AuditRecord = structure {
   pub let AUDIT_ERR_BROKER_UNAVAILABLE : u64 = 3   // svc_lookup miss / cap-table full
   pub let AUDIT_ERR_SEND_FAILED        : u64 = 4   // sys_ipc_send non-zero return
   pub let AUDIT_ERR_HASH_INACTIVE      : u64 = 5   // audit_hash_update without prior audit_hash_init (M3-001)
+  pub let AUDIT_ERR_BUFFER_FULL        : u64 = 6   // AuditClient::audit_append_leaf: buf_len < AUDIT_PAYLOAD_BYTES (#31)
 
   // --- State machine values written to record_state. --------------------
   pub let AUDIT_STATE_IDLE      : u64 = 0
