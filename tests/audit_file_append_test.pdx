@@ -1,0 +1,215 @@
+// tests/audit_file_append_test.pdx — libpdx-audit#32
+// Driver for AuditFileSink::audit_file_append. Exercises the real
+// syscall path end-to-end: append a known line to a path, then
+// re-open the same path read-only and read its bytes back to prove
+// both append semantics (the write actually landed) and durability
+// (a fresh sys_open sees the bytes a prior process/call wrote).
+//
+// This driver is a QEMU-class test in the same sense as
+// tests/test_broker_refusal.pdx's subtest 13 and every call inside
+// tests/test_marshal_harness.pdx: it issues REAL sys_open/sys_write/
+// sys_read/sys_close syscalls (SC+ IDs 2/1/0/3), so it traps outside
+// a kernel-linked runner or QEMU. It does NOT touch AuditBroker,
+// AuditClient, or the svc.audit-journal IPC path at all — no stub
+// substitution concern applies (see tests/README.md's "Why the M4
+// drivers do not invoke sys_ipc_send directly" section; that
+// discipline is about the OTHER transport, not this one).
+//
+// Return convention (identical to the sibling drivers in this dir):
+//   0 — all subtests passed.
+//   1..4 — ordinal of the first failing subtest:
+//     1 — audit_file_append itself did not return AFS_OK (0).
+//     2 — the read-back sys_open (O_RDONLY) failed.
+//     3 — the read-back sys_read loop hit an error, OR the file's
+//         total drained length is under 6 bytes (too short to even
+//         contain "smoke\n").
+//     4 — the last 6 bytes of the drained content do not match the
+//         literal "smoke\n".
+//
+// Fixture: appends "smoke\n" (6 bytes) to "/tmp/audit_test.log" (19
+// bytes, not counting the NUL the callee appends itself — this
+// driver passes path_len=19 exactly, matching the API contract that
+// path_ptr need not be NUL-terminated by the caller). /tmp is used
+// rather than /system/audit/ because this driver runs standalone
+// (no supervisor-provisioned /system/audit/ mount is guaranteed in
+// every environment that links this driver) — the API itself is
+// path-agnostic; #32's own examples reference /system/audit/*.log
+// but audit_file_append places no path-prefix restriction on its
+// caller.
+//
+// Tail-only assertion (not whole-file equality): audit_file_append
+// is an APPEND primitive, so a driver run more than once against the
+// same path (e.g. repeated CI invocations without a cleanup step)
+// accumulates prior runs' bytes ahead of the newest "smoke\n". The
+// only length-independent, run-count-independent invariant is that
+// the FINAL 6 bytes of the file equal "smoke\n" after this driver's
+// own append — which is exactly what "proves append semantics and
+// durability" without requiring the driver to own file cleanup (this
+// driver never sys_unlinks its fixture, matching the read-only-cleanup
+// posture of every other driver in this directory).
+
+module AuditFileAppendTest = structure {
+
+  // ============================================================================
+  // Fixture bytes. Both are plain byte-array literals with a trailing
+  // NUL for readability only — every syscall call site below passes
+  // an explicit length immediate rather than relying on the NUL, per
+  // this tree's "hardcode the immediate directly" convention (see
+  // cat.pdx's cat_msg_*_len siblings, or AuditFileSink's own
+  // AFS_ERR_* pub-lets, for the identical documentation-only pattern).
+  // ============================================================================
+  pub let aft_test_path : [u8; 20] = "/tmp/audit_test.log\0"
+  pub let aft_test_path_len : u64 = 19
+
+  pub let aft_smoke_line : [u8; 7] = "smoke\n\0"
+  pub let aft_smoke_line_len : u64 = 6
+
+  // ============================================================================
+  // aft_read_buf — 4096-byte .bss scratch for the read-back drain.
+  // Sized well above any plausible accumulated-run fixture size for
+  // a smoke test; a real overflow (four thousand-plus prior runs
+  // without cleanup) is out of scope for this driver's assertions.
+  // ============================================================================
+  pub let mut aft_read_buf : [u8; 4096] = uninit @align(8)
+
+  // ============================================================================
+  // audit_file_append_test_run() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{fs}
+  // RAX (output): 0 (all subtests passed) or 1..4 (see module header).
+  //
+  // Register plan (2-push callee-save prologue + sub rsp,8 pad; entry
+  // rsp%16==8, 16 bytes of pushes + 8 pad = 24, 8-24 ≡ 0 mod 16 —
+  // matches history_open_file's identical shape — giving rsp%16==0 at
+  // the one nested `call audit_file_append` site):
+  //   rbx = fd            (set by the read-back sys_open; read by the
+  //                        sys_read loop and both sys_close sites)
+  //   r12 = total_len     (bytes drained so far in the read loop;
+  //                        also doubles as the write-cursor offset
+  //                        into aft_read_buf on each iteration)
+  //   r10 = scratch cursor (buf + total_len address computations;
+  //                        caller-save, safe to clobber across the
+  //                        raw syscalls since it is reloaded fresh
+  //                        each time it is needed)
+  //   r11 = LEA scratch for rip-relative fixture addresses
+  //   rcx = tail-compare loop index (afs_cmp_loop is named
+  //         aft_cmp_loop here to avoid any cross-file label confusion
+  //         with AuditFileSink's own afs_ prefix)
+  // ============================================================================
+  pub let audit_file_append_test_run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "libpdx-audit#32: AuditFileAppendTest::audit_file_append_test_run entry point. Subtest 1: calls AuditFileSink::audit_file_append(aft_test_path, 19, aft_smoke_line, 6) and requires rax == 0 (AFS_OK); on mismatch returns ordinal 1. Subtest 2: re-opens aft_test_path read-only via a raw sys_open(path, O_RDONLY=0, mode=0) -- SC+ ID 2 -- distinct from AuditFileSink's own internal open, proving a FRESH file descriptor (and therefore a fresh VFS lookup, not a cached fd) observes the just-appended bytes; requires rax >= 0, else ordinal 2. Subtest 3: drains the opened fd into aft_read_buf via a sys_read loop (SC+ ID 0) at increasing offsets (buf + total_len, capacity 4096 - total_len computed via register subtraction, no immediate needed), accumulating total_len in r12 until EOF (rax == 0); a negative return mid-loop closes the fd and returns ordinal 3 immediately (aft_fail3_open path); after EOF, the fd is closed unconditionally (aft_read_done) and total_len is checked >= 6 -- too-short content (impossible to contain \"smoke\\n\") also returns ordinal 3 (aft_fail3_closed), but only after the close already ran. Subtest 4: with the fd already closed, computes the tail pointer (aft_read_buf + total_len - 6) and byte-compares it against aft_smoke_line for exactly 6 bytes via the #1248 load idiom (xor reg,reg; mov_b reg,[ptr+rcx*1], explicit *1 scale per U1606) on both sides; any mismatched byte returns ordinal 4, else falls through to the all-pass path returning AFS_OK-shaped 0. Register plan: rbx=fd (read-back only; AuditFileSink's own internal fd for the write path is entirely private to that callee and never observed here), r12=total_len (read-loop accumulator and tail-offset base). 2-push (rbx, r12) + sub rsp,8 = 24 bytes; entry rsp%16==8 - 24 ≡ 0 mod 16, giving proper alignment at the single nested `call audit_file_append` site (the three raw syscalls that follow need no such alignment since `syscall` is not `call`). No test mnemonic -- every check is cmp reg,reg or cmp reg,imm (immediates here: 0, 6, 19 -- all far under the 0x7FFFFFFF bound). No `and` on any r8-r15 register. No 2-op imul. No `neg`. Effects `!{mem, sysreg} @{fs}` -- mem for the .bss buffer writes/reads and the byte-compare loop, sysreg for the raw syscalls plus the nested call's own sysreg tail, @{fs} inherited from audit_file_append's own capability plus this driver's own sys_open/sys_read/sys_close. Labels prefixed aft_ per the reserved-label discipline (this file is a distinct link unit from src/audit_file_sink.pdx's afs_-prefixed labels, but the distinct prefix avoids any reader confusion regardless of linker scoping).",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        // ---- Subtest 1: audit_file_append(path, 19, line, 6) == 0 -------
+        lea rdi, [rip + aft_test_path];
+        mov rsi, 19;
+        lea rdx, [rip + aft_smoke_line];
+        mov rcx, 6;
+        call audit_file_append;
+        cmp rax, 0;
+        jne aft_fail1;
+
+        // ---- Subtest 2: reopen path O_RDONLY, expect fd >= 0 -------------
+        lea rdi, [rip + aft_test_path];
+        xor rsi, rsi;                        // O_RDONLY = 0
+        xor rdx, rdx;                        // mode ignored on read-only open
+        mov rax, 2;                          // SC+ ID 2 = sys_open
+        syscall;
+        cmp rax, 0;
+        jl aft_fail2;
+        mov rbx, rax;                        // rbx = fd
+
+        // ---- Subtest 3: drain fd into aft_read_buf. ----------------------
+        xor r12, r12;                        // total_len = 0
+      aft_read_loop:
+        lea r10, [rip + aft_read_buf];
+        add r10, r12;                        // r10 = &aft_read_buf[total_len]
+        mov rdi, rbx;
+        mov rsi, r10;
+        mov rdx, 4096;
+        sub rdx, r12;                        // remaining capacity
+        mov rax, 0;                          // SC+ ID 0 = sys_read
+        syscall;
+        cmp rax, 0;
+        jl aft_fail3_open;                   // read error, fd still open
+        je aft_read_done;                    // EOF
+        add r12, rax;                        // total_len += n
+        jmp aft_read_loop;
+
+      aft_read_done:
+        mov rdi, rbx;
+        mov rax, 3;                          // SC+ ID 3 = sys_close
+        syscall;
+
+        cmp r12, 6;
+        jl aft_fail3_closed;
+        jmp aft_tail_check;
+
+      aft_fail3_open:
+        mov rdi, rbx;
+        mov rax, 3;                          // SC+ ID 3 = sys_close (best-effort cleanup)
+        syscall;
+        // fall through
+
+      aft_fail3_closed:
+        mov rax, 3;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      aft_tail_check:
+        // ---- Subtest 4: tail 6 bytes of aft_read_buf == "smoke\n" --------
+        lea r10, [rip + aft_read_buf];
+        add r10, r12;
+        sub r10, 6;                          // r10 = &aft_read_buf[total_len - 6]
+        lea r11, [rip + aft_smoke_line];
+        xor rcx, rcx;                        // compare index = 0
+      aft_cmp_loop:
+        cmp rcx, 6;
+        jae aft_pass;
+        xor rax, rax;
+        mov_b rax, [r10 + rcx * 1];
+        xor rdx, rdx;
+        mov_b rdx, [r11 + rcx * 1];
+        cmp rax, rdx;
+        jne aft_fail4;
+        add rcx, 1;
+        jmp aft_cmp_loop;
+
+      aft_fail4:
+        mov rax, 4;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      aft_pass:
+        xor rax, rax;                        // 0 = all subtests passed
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      aft_fail1:
+        mov rax, 1;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      aft_fail2:
+        mov rax, 2;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

@@ -58,6 +58,45 @@ point.
 Semver posture: patch (`1.1.1` → `1.1.2`). Purely additive — no
 existing signature, effect set, wire header, or payload byte moves.
 
+**`audit_file_append` userspace file-sink API.** Closes `#32`.
+Additive, source-only — a new raw-syscall transport that is entirely
+independent of the `AuditBroker`/`AuditClient` IPC lifecycle and the
+`svc.audit-journal` wire format documented above.
+
+- **New file** `src/audit_file_sink.pdx` (`module AuditFileSink`):
+  `audit_file_append(path_ptr, path_len, line_ptr, line_len) -> u64
+  !{mem, sysreg} @{fs}`. Opens the caller's path with
+  `sys_open(O_WRONLY|O_CREAT|O_APPEND, mode 0640)` (SC+ ID 2), writes
+  `line_ptr[0..line_len)` via `sys_write` (SC+ ID 1), closes via
+  `sys_close` (SC+ ID 3, best-effort). `path_ptr`/`path_len` need not
+  be NUL-terminated by the caller — the callee stages a NUL-terminated
+  copy into a 256-byte `.bss` scratch buffer (`afs_path_buf`), gated
+  at `path_len <= 255`.
+
+- **Return convention:** `0` (`AFS_OK`) on success; the raw positive
+  `|errno|` if `sys_open` failed; `AFS_ERR_NAMETOOLONG` (36) if
+  `path_len` overflows the 255-byte gate; `AFS_ERR_EIO` (5) if the
+  write is still short (or failed) after exactly one retry. `line_len
+  == 0` is a legal no-op write (file is still opened+closed).
+
+- **New test** `tests/audit_file_append_test.pdx`
+  (`AuditFileAppendTest::audit_file_append_test_run() -> u64`):
+  appends `"smoke\n"` to `/tmp/audit_test.log`, then re-opens the path
+  read-only and drains it with a raw `sys_read` loop to assert the
+  tail 6 bytes match — proving both append semantics and durability
+  independent of the writing call's own fd. Real-syscall (QEMU-class)
+  driver, same posture as `test_broker_refusal.pdx`'s subtest 13.
+
+- **New capability declaration** (`caps.decl`): `KIND_PDXFS_FILE
+  (write, /system/audit/*)` via `audit_file_append` — disjoint from
+  the existing `KIND_IPC_ENDPOINT(write, svc.audit-journal)` grant;
+  a consumer using only one transport does not need the other's
+  capability.
+
+Semver posture: patch (`1.1.1` → `1.1.2`, same target as `#31` above
+— both land in the same unreleased patch). Purely additive — no
+existing signature, effect set, wire header, or payload byte moves.
+
 ## 1.1.1 — 2026-09-02
 
 **Satellite runtime shim (R91-XREPO.M1 Phase B).** Closes `#19` — the

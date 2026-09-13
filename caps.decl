@@ -81,3 +81,17 @@ wire_ownership:
   endpoint: svc.audit-journal
   frame_header: AUDIT_HDR_WORD
   record_schema: PdxAuditRecord@0.2
+
+# File-sink transport — #32, additive, independent of the IPC path
+# documented above. `AuditFileSink::audit_file_append` (src/
+# audit_file_sink.pdx) is a raw-syscall leaf that never touches
+# AuditBroker/AuditClient, sys_svc_lookup, or sys_ipc_send. It opens
+# its caller-supplied path directly with sys_open(O_WRONLY|O_CREAT|
+# O_APPEND, mode 0640), writes the caller-supplied line bytes, and
+# closes the fd. A consumer that calls this entry point therefore
+# needs filesystem write authority on the target path (e.g.
+# `KIND_PDXFS_FILE(write)` narrowed to /system/audit/ or wherever the
+# caller points it) rather than the KIND_IPC_ENDPOINT grant above —
+# the two transports have disjoint capability footprints and a
+# consumer using only one does not need the other's grant.
+requires: KIND_PDXFS_FILE(write, /system/audit/*) via audit_file_append

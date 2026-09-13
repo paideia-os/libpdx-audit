@@ -1,0 +1,339 @@
+// src/audit_file_sink.pdx — libpdx-audit#32
+// AuditFileSink: userspace file-sink API for /system/audit/*.log.
+//
+// Public entry point:
+//
+//   audit_file_append(path_ptr, path_len, line_ptr, line_len) -> u64
+//
+// Motivation
+// ----------
+// Every existing audit transport in this library (AuditBroker::
+// audit_send_record via sys_svc_lookup/sys_ipc_send, and the satellite
+// JSONL-to-fd-2 shim in audit_broker_satellite.pdx) targets a live IPC
+// endpoint or a debug stream. Neither gives a consumer a durable,
+// human-tail-able append-only log file under /system/audit/ — the
+// shape a supervisor wants for post-mortem `tail -f`-style inspection
+// independent of whether the audit-journal broker daemon is up. #32
+// closes that gap with a minimal, best-effort, syscall-only primitive
+// that composes exactly three SC+ IDs (per design/kernel/
+// r17-m1-001-syscall-shim.md, same frozen table src/syscall_shim.pdx
+// documents):
+//
+//   2 = sys_open(path, flags, mode)   -> fd or -errno
+//   1 = sys_write(fd, buf, count)     -> bytes written or -errno
+//   3 = sys_close(fd)                 -> 0 or -errno (ignored; best-effort)
+//
+// This is a raw-syscall leaf, NOT routed through AuditBroker/
+// AuditClient — it does not touch the PdxAuditRecord@0.2 wire format,
+// audit_id composition, or the svc.audit-journal broker at all. It is
+// a sibling transport a caller reaches for directly when it wants a
+// plain-text line appended to a file, independent of the structured
+// IPC lifecycle the rest of this library implements.
+//
+// API contract
+// ------------
+//   audit_file_append(path_ptr, path_len, line_ptr, line_len) -> u64
+//     path_ptr / path_len — the target path's bytes (NOT required to
+//       be NUL-terminated by the caller; the callee copies path_len
+//       bytes into its own scratch buffer and appends the NUL sys_open
+//       requires). Bounded to AFS_PATH_MAX (255) bytes; a longer path
+//       is refused before any syscall fires.
+//     line_ptr / line_len — the raw bytes to append. No implicit
+//       newline is added — callers that want line-oriented output
+//       (as the design doc's own wording implies) pass a line_ptr
+//       buffer that already ends in '\n'.
+//     Returns 0 (AFS_OK) on success.
+//     Returns a positive errno (the raw |errno| from sys_open,
+//       negated via xor+sub — no `neg` mnemonic, matching cat.pdx's
+//       entry_open_err convention) if the open failed.
+//     Returns AFS_ERR_NAMETOOLONG (36, ENAMETOOLONG) if path_len would
+//       overflow afs_path_buf.
+//     Returns AFS_ERR_EIO (5) if the write could not be completed
+//       after one retry (see "Write semantics" below).
+//
+// Open flags: O_WRONLY(0x01) | O_CREAT(0x40) | O_APPEND(0x200) =
+// 0x241 — identical mask to tools/user/shell's history_open_file
+// (src/history.pdx) and src/user/dispatch.pdx:979. O_APPEND makes
+// every write atomic-at-the-tail with respect to other appenders on
+// the same fd table entry, which is the durability property a
+// multi-writer /system/audit/*.log sink needs.
+//
+// Mode: 0640 octal = 0x1A0 — owner read/write, group read, world
+// nothing. Matches the "supervisor + owning tool can read, nobody
+// else" posture an audit log wants (tighter than history's 0644
+// since audit content may include op_args the owning tool considers
+// sensitive; #32's design comment specifies 0640 explicitly).
+//
+// Write semantics (best-effort, retry-once)
+// ------------------------------------------
+// line_len == 0 is a legal no-op (skips both write attempts, still
+// opens+closes the file so a zero-byte append still touches mtime —
+// matches POSIX `truncate --size=+0` / touch-via-append semantics).
+//
+// Attempt 1: sys_write(fd, line_ptr, line_len). Full-length return
+// (rax == line_len) is success — no retry needed.
+//
+// Any other outcome (negative errno, zero, or a short positive count)
+// triggers exactly ONE retry: compute written_so_far (clamped to 0 if
+// attempt 1 returned negative) and remaining = line_len - written_so_far,
+// then sys_write(fd, line_ptr + written_so_far, remaining). If THAT
+// attempt's return doesn't exactly equal remaining, the sink gives up
+// and reports AFS_ERR_EIO (5) — the design's documented "second
+// short-write reports EIO" clause. The fd is always sys_close'd
+// (best-effort, return ignored) before returning, on every path that
+// reaches a successfully-opened fd, so a failing write never leaks
+// the descriptor.
+//
+// Open failures return the raw errno per the design doc's "open
+// failures return the raw errno" clause — distinguished from write
+// failures (always EIO) so a caller can tell "the path/permissions
+// are wrong" (open) from "the transport hiccuped mid-write" (write)
+// without needing a third sentinel space.
+//
+// Alignment / register discipline
+// --------------------------------
+// No stack allocations at the API surface — the path is staged into
+// a module-level `.bss` scratch buffer (afs_path_buf), never a stack
+// local, so the function's own prologue is pure register push/pop.
+// audit_file_append issues raw `syscall` instructions only (no nested
+// `call` to another pdx function), so SysV's rsp%16==0-before-CALL
+// rule does not bind here — but the 5-push prologue (rbx, r12, r13,
+// r14, r15) still lands rsp%16==0 by construction (entry rsp%16==8,
+// 5*8=40 bytes, 8-40 ≡ 0 mod 16), keeping the discipline uniform with
+// every other leaf in this tree in case a future refactor adds a
+// nested call.
+//
+// Encoder guardrails (paideia-as v0.36+, per the pitfalls this tree
+// keeps re-hitting):
+// - No `test rN, rN` — every zero/equality check is `cmp reg, reg`
+//   or `cmp reg, imm`.
+// - No `and r8-r15, imm64` — no bitwise-with-immediate on any high
+//   register anywhere in this file.
+// - No 2-op `imul r, imm` — not needed here.
+// - No `neg` mnemonic — errno negation via `xor rcx,rcx; sub rcx,rax`
+//   (matches cat.pdx's entry_open_err).
+// - No `sil`/`dil`/`bl` byte-register aliases — every byte load/store
+//   goes through the `xor reg,reg; mov_b reg,[mem]` / `mov_b [mem],reg`
+//   idiom (paideia-as #1248 mitigation).
+// - Every base+index addressing mode uses an explicit `* 1` scale
+//   (paideia-as U1606 — a bare unscaled index register on the right
+//   of `+` hits an operand-parse bug).
+// - <= 4 curried args (audit_file_append takes exactly 4).
+// - No Intel `qword ptr` / `dword ptr` size annotations anywhere.
+// - Every `cmp reg, imm` immediate is <= 0x7FFFFFFF (max here is 255,
+//   the path-length gate).
+// - Module basename `AuditFileSink` matches the file stem
+//   `audit_file_sink.pdx` (PascalCase-of-basename discipline).
+// - Labels prefixed `afs_` — none collide with paideia-as reserved
+//   words (`loop`, `if`, etc.).
+
+module AuditFileSink = structure {
+
+  // ============================================================================
+  // Error code constants (documentation companions — every use site
+  // hardcodes the literal immediate directly in the instruction
+  // stream, matching this tree's existing convention of pub-let
+  // constants as human-readable labels rather than as
+  // memory-loadable operands; see cat.pdx's cat_msg_*_len siblings
+  // for the identical pattern).
+  //
+  //   AFS_OK              = 0   — success.
+  //   AFS_ERR_EIO         = 5   — second short/failed write after one
+  //                               retry. Matches POSIX EIO and this
+  //                               library's own AUDIT_ERR_HASH_INACTIVE
+  //                               numbering space is unrelated (no
+  //                               shared enum with AuditRecord's
+  //                               AUDIT_ERR_* — this file's return
+  //                               space is raw-errno + this one
+  //                               sentinel, not the AuditRecord state
+  //                               machine's own codes).
+  //   AFS_ERR_NAMETOOLONG = 36  — path_len exceeds AFS_PATH_MAX (255),
+  //                               refused before any syscall. Matches
+  //                               POSIX ENAMETOOLONG numerically.
+  // ============================================================================
+  pub let AFS_OK : u64 = 0
+  pub let AFS_ERR_EIO : u64 = 5
+  pub let AFS_ERR_NAMETOOLONG : u64 = 36
+
+  // ============================================================================
+  // afs_path_buf — 256-byte .bss scratch for the NUL-terminated copy
+  // of the caller's path bytes. sys_open requires a NUL-terminated
+  // C string; the API accepts an explicit (ptr, len) pair instead
+  // (the caller's path bytes need not be NUL-terminated themselves,
+  // e.g. a slice of a larger buffer), so audit_file_append copies
+  // path_len bytes here and appends the terminator itself.
+  //
+  // 256 bytes matches the largest path scratch buffer already in use
+  // in the sibling `shell` tool (_hi_path_buf, src/history.pdx) —
+  // AFS_PATH_MAX (255, defined inline at the gate check below) leaves
+  // exactly one byte for the NUL.
+  // ============================================================================
+  pub let mut afs_path_buf : [u8; 256] = uninit @align(8)
+
+  // ============================================================================
+  // audit_file_append(path_ptr, path_len, line_ptr, line_len) -> u64
+  //
+  // Signature: (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs}
+  //   RDI (input):  path_ptr — bytes of the target path (need not be
+  //                            NUL-terminated; see afs_path_buf above).
+  //   RSI (input):  path_len — byte count of path_ptr, <= 255.
+  //   RDX (input):  line_ptr — bytes to append.
+  //   RCX (input):  line_len — byte count of line_ptr; 0 is a legal
+  //                            no-op write.
+  //   RAX (output): AFS_OK (0) on success
+  //               | AFS_ERR_NAMETOOLONG (36) if path_len > 255
+  //               | positive errno (raw |errno|) if sys_open failed
+  //               | AFS_ERR_EIO (5) if the write failed after one retry
+  //
+  // See the module header above for the full open-flags / mode /
+  // write-retry / register-discipline rationale.
+  //
+  // Register plan (5-push callee-save prologue; no nested `call`, so
+  // rsp%16==0 is a hygiene nicety here rather than a strict
+  // requirement, but it falls out of the push count for free):
+  //   r12 = path_ptr   (caller's path bytes, source of the copy loop)
+  //   r13 = path_len   (copy-loop bound + NUL-terminator offset)
+  //   r14 = line_ptr   (survives across both write attempts)
+  //   r15 = line_len   (survives across both write attempts)
+  //   rbx = fd         (set once sys_open succeeds; used by both
+  //                     sys_write attempts and the closing sys_close)
+  //   rcx = copy-loop index (afs_copy_loop); scratch elsewhere
+  //   rax = byte-load / syscall-number / syscall-return scratch
+  //   r10 = written_so_far (attempt-1 partial count, clamped >= 0)
+  //   r9  = remaining bytes for the retry attempt
+  //   r11 = LEA scratch for afs_path_buf's rip-relative address
+  // ============================================================================
+  pub let audit_file_append : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (path_ptr: u64) (path_len: u64) (line_ptr: u64) (line_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "libpdx-audit#32: audit_file_append entry point. Composes a raw-syscall append-only file write, independent of the AuditBroker/AuditClient IPC transport: (1) bound-check path_len <= 255 (AFS_PATH_MAX, leaves room for the NUL in the 256-byte afs_path_buf .bss scratch) -- over-length paths return AFS_ERR_NAMETOOLONG (36) before any syscall fires; (2) byte-copy loop stages path_ptr[0..path_len) into afs_path_buf via the #1248 load/store idiom (xor rax,rax; mov_b rax,[r12+rcx*1] then mov_b [r11+rcx*1],rax, explicit *1 scale per U1606) and appends a NUL terminator at afs_path_buf[path_len]; (3) sys_open(afs_path_buf, 0x241, 0x1A0) -- flags O_WRONLY(0x01)|O_CREAT(0x40)|O_APPEND(0x200), mode 0640 octal -- SC+ ID 2; a negative return is negated via xor rcx,rcx; sub rcx,rax (no `neg` mnemonic) and returned as the raw positive errno; (4) on open success (rbx = fd), line_len == 0 short-circuits straight to the close-and-return-AFS_OK path (legal no-op write, but the file is still opened+closed so a zero-byte append still touches mtime); (5) otherwise sys_write(fd, line_ptr, line_len) -- SC+ ID 1 -- and if rax == line_len (full write) proceed to close; else this is a short/failed write: compute written_so_far (0 if the first attempt returned negative, else the partial positive count) and remaining = line_len - written_so_far, then retry exactly once with sys_write(fd, line_ptr + written_so_far, remaining); if the retry's return doesn't exactly equal remaining, close the fd and report AFS_ERR_EIO (5) -- the design's 'second short-write reports EIO' clause; (6) sys_close(fd) -- SC+ ID 3, return ignored, best-effort -- runs on every path that reached a successfully-opened fd, so a failing write never leaks the descriptor. Register plan: r12=path_ptr, r13=path_len, r14=line_ptr, r15=line_len, rbx=fd -- all five are SysV callee-save, preserved across every raw `syscall` (which only clobbers rax/rcx/r11 by hardware convention plus whatever the kernel handler treats as clobbered args, i.e. rdi/rsi/rdx -- never rbx/r12-r15). 5-push prologue (40 bytes) lands rsp%16==0 from an assumed entry rsp%16==8 (post-CALL SysV state) even though this leaf makes no nested `call` of its own -- kept for uniformity with the rest of this tree's push/pop discipline. No test mnemonic anywhere; every comparison is cmp reg,reg or cmp reg,imm. No `and` on any r8-r15 register. No 2-op imul. Every cmp immediate <= 255 (well within the 0x7FFFFFFF bound). Effects `!{mem, sysreg} @{fs}` -- mem for the .bss path copy and the byte loads/stores, sysreg for the three raw `syscall` instructions, @{fs} because sys_open/sys_write/sys_close are all filesystem-gated in the syscall shim (matches src/user's Entry::_start / History::history_open_file precedent, both `@{fs}`). Labels prefixed afs_ per the reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                       // r12 = path_ptr
+        mov r13, rsi;                       // r13 = path_len
+        mov r14, rdx;                       // r14 = line_ptr
+        mov r15, rcx;                       // r15 = line_len
+
+        // ---- Gate: path_len must fit afs_path_buf minus the NUL. -------
+        cmp r13, 255;
+        ja afs_path_too_long;
+
+        // ---- Copy path_ptr[0..path_len) into afs_path_buf, NUL-term. --
+        xor rcx, rcx;                        // copy index = 0
+      afs_copy_loop:
+        cmp rcx, r13;
+        jae afs_copy_done;
+        xor rax, rax;
+        mov_b rax, [r12 + rcx * 1];          // load src byte (#1248 idiom)
+        lea r11, [rip + afs_path_buf];
+        mov_b [r11 + rcx * 1], rax;          // store into scratch buffer
+        add rcx, 1;
+        jmp afs_copy_loop;
+      afs_copy_done:
+        lea r11, [rip + afs_path_buf];
+        mov_b [r11 + rcx * 1], 0;            // NUL terminator at buf[path_len]
+
+        // ---- sys_open(afs_path_buf, O_WRONLY|O_CREAT|O_APPEND, 0640). --
+        lea rdi, [rip + afs_path_buf];
+        mov rsi, 0x241;                      // O_WRONLY(0x01)|O_CREAT(0x40)|O_APPEND(0x200)
+        mov rdx, 0x1A0;                      // mode 0640 octal
+        mov rax, 2;                          // SC+ ID 2 = sys_open
+        syscall;
+        // rax = fd (>= 0) or -errno.
+
+        cmp rax, 0;
+        jl afs_open_err;
+
+        mov rbx, rax;                        // rbx = fd
+
+        // ---- line_len == 0 is a legal no-op write. ----------------------
+        cmp r15, 0;
+        je afs_write_ok;
+
+        // ---- Attempt 1: sys_write(fd, line_ptr, line_len). --------------
+        mov rdi, rbx;
+        mov rsi, r14;
+        mov rdx, r15;
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+        // rax = n1 (bytes written) or -errno.
+
+        cmp rax, r15;
+        je afs_write_ok;                     // full write, no retry needed
+
+        // ---- Short/failed first write: retry exactly once. --------------
+        cmp rax, 0;
+        jl afs_first_neg;
+        mov r10, rax;                        // r10 = written_so_far (partial, positive)
+        jmp afs_after_first;
+      afs_first_neg:
+        xor r10, r10;                        // written_so_far = 0 (first attempt errored)
+      afs_after_first:
+        mov r9, r15;                         // r9 = remaining = line_len - written_so_far
+        sub r9, r10;
+
+        mov rdi, rbx;
+        lea rsi, [r14 + r10 * 1];            // buf = line_ptr + written_so_far
+        mov rdx, r9;
+        mov rax, 1;                          // SC+ ID 1 = sys_write (retry)
+        syscall;
+        // rax = n2 (bytes written) or -errno.
+
+        cmp rax, r9;
+        jne afs_write_eio;
+        // fall through: retry covered the remaining bytes exactly.
+
+      afs_write_ok:
+        mov rdi, rbx;
+        mov rax, 3;                          // SC+ ID 3 = sys_close (best-effort)
+        syscall;
+
+        xor rax, rax;                        // AFS_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      afs_write_eio:
+        mov rdi, rbx;
+        mov rax, 3;                          // SC+ ID 3 = sys_close (best-effort cleanup)
+        syscall;
+
+        mov rax, 5;                          // AFS_ERR_EIO
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      afs_open_err:
+        xor rcx, rcx;
+        sub rcx, rax;                        // rcx = 0 - (-errno) = errno (no `neg` mnemonic)
+        mov rax, rcx;                        // rax = |errno| (raw, positive)
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      afs_path_too_long:
+        mov rax, 36;                         // AFS_ERR_NAMETOOLONG
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

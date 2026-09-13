@@ -52,6 +52,20 @@ Both landed at M4.
   pattern. Returns 0 on pass or a 1..5 subtest ordinal on failure.
   Effects `!{mem, sysreg} @{cap, sched}` inherited from the
   lifecycle callees.
+- `audit_file_append_test.pdx` — libpdx-audit#32 driver. Exports
+  `AuditFileAppendTest::audit_file_append_test_run() -> u64`. Calls
+  the real `AuditFileSink::audit_file_append` against
+  `/tmp/audit_test.log`, then re-opens the same path read-only and
+  drains it with a raw `sys_read` loop to assert the tail 6 bytes
+  equal `"smoke\n"` — proving both append semantics and durability.
+  Does not touch the `AuditBroker`/`AuditClient` IPC transport or the
+  `syscall_shim_stub.pdx` substitution at all (see "Why the M4
+  drivers do not invoke `sys_ipc_send` directly" below — that
+  discipline does not apply to this file-sink primitive). Issues
+  real `sys_open`/`sys_write`/`sys_read`/`sys_close` syscalls, so
+  it traps outside a kernel-linked runner or QEMU, same posture as
+  `test_broker_refusal.pdx`'s subtest 13. Returns 0 on pass or a
+  1..4 subtest ordinal on failure. Effects `!{mem, sysreg} @{fs}`.
 - `syscall_shim_stub.pdx` — LA.M1-005 (#24) test double. Exports
   the same three symbols as `src/syscall_shim.pdx`
   (`sys_svc_lookup`, `sys_ipc_send`, `sys_getpid`) with byte-for-
